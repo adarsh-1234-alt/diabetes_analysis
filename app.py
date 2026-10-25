@@ -20,8 +20,9 @@ Stage 2 notes
 
 Stage 3 notes
 -------------
-* The risk figure is a Plotly gauge with the three risk bands and the tuned
-  threshold marked; a plain progress bar is used only if Plotly is unavailable.
+* The risk figure is a matplotlib speedometer with the three risk bands and the
+  tuned threshold marked. Every chart is matplotlib, so no optional plotting
+  package can silently disappear on a deployment.
 * Every input carries a colour-coded status pill (normal / borderline /
   abnormal / not measured) derived from clinical reference bands, so an
   out-of-range value is visible at a glance rather than buried in a warning list.
@@ -29,6 +30,19 @@ Stage 3 notes
   to a healthy target and shows the resulting drop in risk.
 * Presentation is grouped into cards (`st.container(border=True)`) with a single
   injected stylesheet, so the page reads as one designed surface.
+
+Stage 4 notes
+-------------
+* LIME runs next to SHAP on the same patient: two importance charts, a rank
+  correlation and a sign-agreement count make it obvious when the two methods
+  tell the same story and when they disagree.
+* SHAP dependence plots for the three globally strongest features show whether a
+  feature's effect is linear, saturating or non-monotone.
+* A two-feature interaction heat map sweeps both features at once, marks where
+  this patient sits and quantifies whether the pair behaves additively.
+* Patient comparison scores a second profile side by side with the sidebar one.
+* The recommendation engine ranks every modifiable value by how much risk it
+  would remove if brought to its healthy target, plus the combined scenario.
 """
 import hmac
 import json
@@ -43,6 +57,7 @@ import sklearn
 import matplotlib
 matplotlib.use("Agg")  # headless backend — safe inside Streamlit
 import matplotlib.pyplot as plt
+from matplotlib.patches import Circle, Wedge
 import numpy as np
 import pandas as pd
 import shap
@@ -54,12 +69,12 @@ try:  # optional: only needed if the saved model is an XGBoost pipeline
 except Exception:  # noqa: BLE001
     XGBOOST_VERSION = None
 
-try:  # Stage 3: gauge + comparison charts. The app degrades to native widgets.
-    import plotly.graph_objects as go
-    PLOTLY_OK = True
+try:  # Stage 4: a second, model-agnostic explanation method.
+    from lime.lime_tabular import LimeTabularExplainer
+    LIME_OK = True
 except Exception:  # noqa: BLE001
-    go = None
-    PLOTLY_OK = False
+    LimeTabularExplainer = None
+    LIME_OK = False
 
 # ── Paths ───────────────────────────────────────────────────────────────────
 BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
@@ -505,6 +520,32 @@ STATUS_ICON = {"Normal": "●", "Borderline": "▲",
                "Abnormal": "■", "Not measured": "○"}
 BAND_COLOUR = {"Low": "#2e9e4f", "Moderate": "#e0a223", "High": "#d64545"}
 
+# Stage 4: risk factors a patient can realistically change, with the healthy
+# target each scenario moves them to. Shared by Tab 1 and the recommendation
+# engine so both always use the same targets.
+MODIFIABLE = {
+    "Glucose":       (100,  "mg/dL",  "fasting glucose around 100 mg/dL"),
+    "BMI":           (23.0, "kg/m²",  "BMI inside the healthy 18.5–24.9 band"),
+    "BloodPressure": (75,   "mm Hg",  "diastolic pressure around 75 mm Hg"),
+    "Insulin":       (80,   "mu U/ml", "insulin in the middle of the normal range"),
+    "SkinThickness": (20,   "mm",     "skin fold around 20 mm"),
+}
+EFFORT = {
+    "Glucose":       "Diet + medication…",
+    "BMI":           "Diet + exercise…",
+    "BloodPressure": "Diet + medication…",
+    "Insulin":       "Medical review…",
+    "SkinThickness": "Nutrition review…",
+}
+COMPACT_LABELS = {
+    "Glucose":       "Glucose",
+    "BMI":           "BMI",
+    "BloodPressure": "Blood pressure",
+    "Insulin":       "Insulin",
+    "SkinThickness": "Skin fold",
+}
+
+
 
 def field_status(feature, value):
     """Classify one input as Normal / Borderline / Abnormal / Not measured.
@@ -579,36 +620,209 @@ def show_pill(feature, value):
 
 
 def risk_gauge(risk, threshold, level):
-    """Plotly gauge: three risk bands plus a marker at the tuned threshold."""
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=risk * 100,
-        number={"suffix": "%", "font": {"size": 32, "color": "#1f2933"},
-                "valueformat": ".1f"},
-        gauge={
-            "shape": "angular",
-            "axis": {"range": [0, 100], "tickwidth": 1, "tickcolor": "#9aa3ad",
-                     "showticklabels": False},
-            "bar": {"color": BAND_COLOUR[level], "thickness": 0.26},
-            "bgcolor": "white",
-            "borderwidth": 0,
-            "steps": [
-                {"range": [0, 30], "color": "#e6f4ea"},
-                {"range": [30, 60], "color": "#fff4d6"},
-                {"range": [60, 100], "color": "#fde8e6"},
-            ],
-            "threshold": {"line": {"color": "#111827", "width": 3},
-                          "thickness": 0.78, "value": threshold * 100},
-        },
-    ))
-    fig.update_layout(
-        height=250,
-        margin={"l": 38, "r": 38, "t": 14, "b": 0},
-        paper_bgcolor="rgba(0,0,0,0)",
-        font={"family": "sans serif", "color": "#1f2933"},
-    )
+    """Matplotlib speedometer: three risk bands, a needle and the threshold.
+
+    Drawn with plain patches instead of Plotly so the gauge cannot fall back to
+    a bare progress bar when an optional package is missing from a deployment.
+    """
+    fig = plt.figure(figsize=(4.6, 2.8))
+    ax = fig.add_subplot(111)
+    ax.set_xlim(-1.18, 1.18)
+    ax.set_ylim(-0.37, 1.18)
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    # Wedge angles: 180° = 0%, 90° = 50%, 0° = 100%.
+    for low_angle, high_angle, colour in ((126, 180, "#e6f4ea"),
+                                          (72, 126, "#fff4d6"),
+                                          (0, 72, "#fde8e6")):
+        ax.add_patch(Wedge((0, 0), 1.0, low_angle, high_angle, width=0.22,
+                           facecolor=colour, edgecolor="white", linewidth=1.5))
+
+    needle = np.deg2rad(180 - 1.8 * risk * 100)
+    ax.plot([0, 0.74 * np.cos(needle)], [0, 0.74 * np.sin(needle)],
+            color=BAND_COLOUR[level], lw=4, solid_capstyle="round", zorder=4)
+    ax.add_patch(Circle((0, 0), 0.055, color=BAND_COLOUR[level], zorder=5))
+
+    tick = np.deg2rad(180 - 1.8 * threshold * 100)
+    ax.plot([0.78 * np.cos(tick), 1.05 * np.cos(tick)],
+            [0.78 * np.sin(tick), 1.05 * np.sin(tick)],
+            color="#111827", lw=2.5, zorder=3)
+
+    ax.text(0, -0.13, f"{risk:.1%}", ha="center", va="center",
+            fontsize=20, fontweight="bold", color="#1f2933")
+    ax.text(0, -0.31, f"{level} risk", ha="center", va="center",
+            fontsize=9, fontweight="600", color=BAND_COLOUR[level])
+
+    for value in (0, 30, 60, 100):
+        angle = np.deg2rad(180 - 1.8 * value)
+        ax.text(1.13 * np.cos(angle), 1.13 * np.sin(angle), f"{value}%",
+                ha="center", va="center", fontsize=8, color="#6b7280")
+
+    fig.tight_layout(pad=0.1)
     return fig
 
+
+# ── Stage 4: explanation + recommendation helpers ───────────────────────────
+def risk_level(risk):
+    """Map a probability to the three bands used across the app."""
+    return "Low" if risk < .3 else "Moderate" if risk < .6 else "High"
+
+
+def short_label(feature):
+    """Feature name without its unit parenthesis, for compact tables/metrics."""
+    return FEATURE_INFO[feature]["label"].split(" (")[0]
+
+
+def tint_status(value):
+    """Pandas Styler callback: colour a Status cell using the app's palette."""
+    text, tint = STATUS_STYLE.get(value, ("#1f2933", "#ffffff"))
+    return f"background-color: {tint}; color: {text}; font-weight: 600"
+
+
+def rank_correlation(a, b):
+    """Spearman rank correlation of *absolute* importance.
+
+    SHAP and LIME measure importance on different scales and against different
+    reference points (dataset average vs local neighbourhood), so asking whether
+    they rank the features' magnitudes the same way is the fair comparison. The
+    sign of each weight is reported separately, feature by feature.
+    """
+    a = pd.Series(np.abs(np.asarray(a, dtype=float))).rank().to_numpy()
+    b = pd.Series(np.abs(np.asarray(b, dtype=float))).rank().to_numpy()
+    if np.std(a) == 0 or np.std(b) == 0:
+        return None
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def render_contribution_bars(values, title):
+    """One horizontal importance chart, red = raises risk, blue = lowers it."""
+    values = np.asarray(values, dtype=float)
+    order = np.argsort(np.abs(values))
+    labels = [FEATURE_INFO[FEATURES[i]]["label"] for i in order]
+    ordered = values[order]
+    colours = ["#d64545" if value > 0 else "#1f6feb" for value in ordered]
+    span = max(float(np.abs(ordered).max()), 1e-9)
+
+    fig, ax = plt.subplots(figsize=(6.2, 3.2))
+    ax.barh(labels, ordered, color=colours, height=0.65)
+    ax.axvline(0, color="#9aa3ad", lw=1)
+    for position, value in enumerate(ordered):
+        offset = 0.02 * span if value >= 0 else -0.02 * span
+        ax.text(value + offset, position, f"{value:+.3f}", va="center",
+                ha="left" if value >= 0 else "right",
+                fontsize=7, color="#1f2933")
+    ax.set_xlim(-span * 1.45, span * 1.45)
+    ax.set_title(title, fontsize=10)
+    ax.set_xlabel("impact on predicted risk", fontsize=8)
+    ax.tick_params(labelsize=7)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+@st.cache_resource(show_spinner=False)
+def load_lime_explainer(path: str):
+    """Fit LIME on the full dataset when available, else the background sample.
+
+    LIME needs a training distribution to draw neighbours from; the 100-row
+    background sample works but the full 768-row dataset gives a fuller
+    neighbourhood. `discretize_continuous=False` is deliberate: LIME's
+    discretiser fails on small samples (scipy truncnorm domain error) and plain
+    continuous features are easier to read in the chart.
+    """
+    frame = pd.read_csv(path)
+    training = frame[FEATURES].apply(pd.to_numeric, errors="coerce")
+    training = training.fillna(training.median())
+    return LimeTabularExplainer(
+        training.to_numpy(dtype=float),
+        feature_names=FEATURES,
+        class_names=["No diabetes", "Diabetes"],
+        mode="classification",
+        discretize_continuous=False,
+        random_state=42,
+    )
+
+
+def lime_contribution(lime_explainer, row_frame):
+    """Local LIME weights for class 1, in FEATURES order, plus LIME's own risk.
+
+    LIME cannot ingest missing values, while the model pipeline imputes them
+    internally. Fill the "not measured" sentinels with the same training medians
+    the app already reports, so LIME explains the row the model actually scores.
+    """
+    frame = row_frame[FEATURES].astype(float).copy()
+    frame = frame.fillna(pd.Series(MEDIANS))   # DataFrame.fillna(Series) aligns on columns
+    values = frame.iloc[0].to_numpy(dtype=float)
+
+    def predict_fn(arr):
+        return np.asarray(
+            model.predict_proba(pd.DataFrame(arr, columns=FEATURES)), dtype=float)
+
+    explanation = lime_explainer.explain_instance(
+        values, predict_fn, labels=(1,), num_features=len(FEATURES),
+        num_samples=1000)
+    weights = dict(explanation.as_list(label=1))
+    series = pd.Series(
+        {feature: float(weights.get(feature, 0.0)) for feature in FEATURES},
+        dtype=float)
+    local_risk = float(explanation.predict_proba[1])
+    return series, local_risk
+
+
+def improvement_scenarios(cleaned_row, model_obj):
+    """Rank modifiable values by the risk left after moving each to its target.
+
+    Returns (rows, combined_risk). Each row carries the current value, target,
+    resulting risk and reduction. The combined scenario moves every eligible
+    value at once and is written with a caveat in the UI, because real risk
+    factors are correlated and the model treats them independently.
+    """
+    rows = []
+    for feature, (target, unit, note) in MODIFIABLE.items():
+        current = cleaned_row.get(feature)
+        if current is None or pd.isna(current):
+            continue
+        try:
+            current = float(current)
+        except (TypeError, ValueError):
+            continue
+        if current <= float(target):
+            continue
+        try:
+            changed = cleaned_row.copy()
+            changed[feature] = float(target)
+            new_risk = float(model_obj.predict_proba(
+                pd.DataFrame([changed])[FEATURES])[0, 1])
+        except Exception:  # noqa: BLE001
+            continue
+        rows.append({
+            "feature": feature,
+            "current": current,
+            "target": float(target),
+            "unit": unit,
+            "note": note,
+            "new_risk": min(max(new_risk, 0.0), 1.0),
+        })
+
+    rows.sort(key=lambda row: row["new_risk"])
+    for position, row in enumerate(rows, start=1):
+        row["rank"] = position
+
+    combined_risk = None
+    if rows:
+        combo = cleaned_row.copy()
+        for row in rows:
+            combo[row["feature"]] = row["target"]
+        try:
+            combined_risk = float(model_obj.predict_proba(
+                pd.DataFrame([combo])[FEATURES])[0, 1])
+            combined_risk = min(max(combined_risk, 0.0), 1.0)
+        except Exception:  # noqa: BLE001
+            combined_risk = None
+    return rows, combined_risk
 
 
 # ── Cached resources ─────────────────────────────────────────────────────────
@@ -864,7 +1078,7 @@ st.markdown(
     '<div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 4px 0">'
     f'<span class="tag">{meta.get("best_model", "unknown")}</span>'
     f'<span class="tag">threshold {THRESHOLD:.2f}</span>'
-    '<span class="tag">SHAP explainability</span></div>',
+    '<span class="tag">SHAP + LIME</span></div>',
     unsafe_allow_html=True,
 )
 st.caption(
@@ -906,11 +1120,12 @@ if missing_features:
         f"{len(FEATURES)}** measured values — "
         f"{', '.join(missing_features)} were imputed.")
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🔮 Risk Prediction",
     "🧠 SHAP Explainability",
     "📊 Model Performance",
-    "🔎 Data Explorer"
+    "🔎 Data Explorer",
+    "🆚 Patient Comparison"
 ])
 
 # ── Tab 1: Prediction ─────────────────────────────────────────────────────
@@ -924,21 +1139,15 @@ with tab1:
     with left:
         with st.container(border=True):
             st.markdown("#### Estimated risk")
-            if PLOTLY_OK:
-                st.plotly_chart(risk_gauge(risk, THRESHOLD, level),
-                                use_container_width=True,
-                                config={"displayModeBar": False})
-            else:
-                st.metric("Estimated Diabetes Risk", f"{risk:.1%}")
-                st.progress(risk)
+            gauge_fig = risk_gauge(risk, THRESHOLD, level)
+            st.pyplot(gauge_fig)
+            plt.close(gauge_fig)
             if risk_interval:
                 st.caption(f"90% interval: **{risk_interval[0]:.1%} – {risk_interval[1]:.1%}** "
                            f"· {risk_interval[2]} similar patients")
             st.caption(
                 "Bands: 0–30% low · 30–60% moderate · 60–100% high. "
-                + (f"The dark line marks the screening threshold ({THRESHOLD:.2f})."
-                   if PLOTLY_OK else
-                   f"Screening threshold: {THRESHOLD:.2f}."))
+                f"The dark line marks the screening threshold ({THRESHOLD:.2f}).")
 
     with right:
         with st.container(border=True):
@@ -1021,17 +1230,9 @@ with tab1:
         "model's learned relationships — not a forecast, because real improvement also depends "
         "on factors the model never sees.")
 
-    MODIFIABLE = {
-        "Glucose":        (100, "mg/dL",    "fasting glucose around 100 mg/dL"),
-        "BMI":            (23.0, "kg/m²",   "BMI inside the healthy 18.5–24.9 band"),
-        "BloodPressure":  (75, "mm Hg",     "diastolic pressure around 75 mm Hg"),
-        "Insulin":        (80, "mu U/ml",   "insulin in the middle of the normal range"),
-        "SkinThickness":  (20, "mm",        "skin fold around 20 mm"),
-    }
-
     with st.container(border=True):
         next_risk = None
-        ctl, info = st.columns([1, 2], gap="large")
+        ctl, info = st.columns([1.3, 1.7], gap="large")
 
         with ctl:
             chosen = st.selectbox(
@@ -1075,41 +1276,38 @@ with tab1:
             e1, e2, e3 = st.columns(3)
             e1.metric("Current risk", f"{risk:.1%}")
             e2.metric("After improvement", f"{next_risk:.1%}",
-                      delta=f"{delta * 100:+.1f} pts")
+                      delta=f"{delta * 100:+.1f} pts",
+                      delta_color="inverse")
             e3.metric("Relative change",
                       f"{delta / risk:.0%}" if risk > 1e-6 else "n/a")
 
-            if PLOTLY_OK:
-                fig_ba = go.Figure(go.Bar(
-                    x=[risk * 100, next_risk * 100],
-                    y=["Current", "After improvement"],
-                    orientation="h",
-                    marker_color=[BAND_COLOUR[level], "#1f6feb"],
-                    text=[f"{risk:.1%}", f"{next_risk:.1%}"],
-                    textposition="inside",
-                    insidetextanchor="end",
-                    textfont={"color": "#ffffff", "size": 13},
-                    hovertemplate="%{y}: %{x:.1f}%<extra></extra>",
-                ))
-                fig_ba.add_vline(
-                    x=THRESHOLD * 100, line_dash="dash", line_color="#111827",
-                    annotation_text=f"threshold {THRESHOLD:.2f}",
-                    annotation_position="top")
-                fig_ba.update_layout(
-                    height=230,
-                    margin={"l": 10, "r": 40, "t": 34, "b": 26},
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    xaxis={"range": [0, 108], "title": "Predicted risk (%)",
-                           "showgrid": True, "gridcolor": "#eef1f4"},
-                    yaxis={"autorange": "reversed"},
-                    showlegend=False,
-                )
-                st.plotly_chart(fig_ba, use_container_width=True,
-                                config={"displayModeBar": False})
-            else:
-                st.progress(risk)
-                st.caption(f"After improvement: **{next_risk:.1%}**")
+            fig_ba, ax_ba = plt.subplots(figsize=(6.8, 2.2))
+            bar_positions = ["Current", "After improvement"]
+            bar_values = [risk * 100, next_risk * 100]
+            bars = ax_ba.barh(bar_positions, bar_values,
+                              color=[BAND_COLOUR[level], "#1f6feb"], height=0.55)
+            for bar, value in zip(bars, bar_values):
+                inside = value > 14
+                ax_ba.text(value - 1.5 if inside else value + 1.5,
+                           bar.get_y() + bar.get_height() / 2,
+                           f"{value:.1f}%", va="center",
+                           ha="right" if inside else "left",
+                           color="white" if inside else "#1f2933",
+                           fontsize=10, fontweight="bold")
+            ax_ba.axvline(THRESHOLD * 100, color="#111827", ls="--", lw=1.5)
+            ax_ba.text(THRESHOLD * 100 + 1.0, -0.47,
+                       f"threshold {THRESHOLD:.2f}", fontsize=8, color="#111827")
+            ax_ba.set_xlim(0, 108)
+            ax_ba.set_ylim(1.55, -0.55)
+            ax_ba.set_xlabel("Predicted risk (%)", fontsize=9)
+            ax_ba.grid(axis="x", color="#eef1f4", lw=0.8)
+            ax_ba.set_axisbelow(True)
+            ax_ba.tick_params(labelsize=9)
+            for side in ("top", "right"):
+                ax_ba.spines[side].set_visible(False)
+            fig_ba.tight_layout()
+            st.pyplot(fig_ba)
+            plt.close(fig_ba)
 
             if next_risk < THRESHOLD <= risk:
                 st.success(
@@ -1123,6 +1321,73 @@ with tab1:
         else:
             st.caption("The comparison appears once a value above its healthy target is "
                        "selected.")
+
+    # ── Stage 4: recommendation engine ─────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🏆 What to improve first")
+    st.markdown(
+        "Each modifiable value is moved to its healthy target **one at a time**, then "
+        "the scenarios are ranked by the risk that remains. The top row is the single "
+        "change with the largest modelled benefit for this patient.")
+    rec_rows, combined_risk = improvement_scenarios(cleaned, model)
+
+    with st.container(border=True):
+        if not rec_rows:
+            st.success(
+                "✅ Every modifiable value is already at or below its healthy target, so "
+                "there is no single-change scenario left to rank. Maintaining these "
+                "values is the recommendation.")
+        else:
+            best = rec_rows[0]
+            best_gain = (risk - best["new_risk"]) * 100
+            total_gain = ((risk - combined_risk) * 100
+                          if combined_risk is not None else None)
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Change this first", COMPACT_LABELS[best["feature"]],
+                      delta=f"-{best_gain:.1f} pts" if best_gain > 0 else None,
+                      delta_color="inverse" if best_gain > 0 else "off",
+                      help=f"Move {short_label(best['feature'])} from "
+                           f"{fmt_value(best['feature'], best['current'])} to "
+                           f"{best['target']:g} {best['unit']}.")
+            m2.metric("Risk after that change", f"{best['new_risk']:.1%}")
+            m3.metric("If every target is reached",
+                      f"{combined_risk:.1%}" if combined_risk is not None else "n/a",
+                      delta=(f"-{total_gain:.1f} pts"
+                             if total_gain is not None and total_gain > 0 else None),
+                      delta_color="inverse" if total_gain is not None and total_gain > 0
+                      else "off")
+
+            rec_df = pd.DataFrame({
+                "Priority":       [row["rank"] for row in rec_rows],
+                "Feature":        [short_label(row["feature"]) for row in rec_rows],
+                "Current":        [fmt_value(row["feature"], row["current"])
+                                   for row in rec_rows],
+                "Healthy target": [f"{row['target']:g} {row['unit']}" for row in rec_rows],
+                "Risk after":     [f"{row['new_risk']:.1%}" for row in rec_rows],
+                "Reduction":      [f"−{(risk - row['new_risk']) * 100:.1f} pts"
+                                   for row in rec_rows],
+                "Typical effort": [EFFORT[row["feature"]] for row in rec_rows],
+            })
+            st.dataframe(rec_df, hide_index=True, use_container_width=True)
+
+            if best_gain > 0:
+                st.markdown(
+                    f"**Start with {short_label(best['feature'])}.** Bringing it from "
+                    f"{fmt_value(best['feature'], best['current'])} to "
+                    f"**{best['target']:g} {best['unit']}** is the single largest modelled "
+                    f"reduction ({best_gain:.1f} points).")
+            if combined_risk is not None:
+                st.caption(
+                    f"Reaching every target together is modelled at **{combined_risk:.1%}**"
+                    + (f" ({total_gain:.1f} points lower)." if total_gain is not None else ".")
+                    + " Treat that as an optimistic ceiling: the model moves one value at a "
+                    "time, while in reality diet, weight, glucose and insulin change together "
+                    "and interact.")
+                if combined_risk < THRESHOLD <= risk:
+                    st.success(
+                        f"Combined, these changes would move the patient from a positive to "
+                        f"a negative screening call at the {THRESHOLD:.2f} threshold.")
 
     if missing_features:
         st.info(
@@ -1275,6 +1540,120 @@ with tab2:
             })
             st.dataframe(display_df, hide_index=True, use_container_width=True)
 
+            # ── Stage 4: LIME alongside SHAP ────────────────────────────────
+            st.markdown("---")
+            st.subheader("🍋 LIME — a second opinion")
+            st.markdown(
+                "SHAP explains this prediction by fairly distributing credit across the "
+                "features. **LIME** works differently: it perturbs this patient's values, "
+                "watches how the prediction moves, and fits a simple local model around "
+                "them. Because the two methods make different assumptions, comparing them "
+                "is a useful honesty check on the explanation.")
+
+            if not LIME_OK:
+                st.info("ℹ️ LIME is not installed in this deployment, so only SHAP is shown. "
+                        "Add `lime>=0.2.0.1` to `requirements.txt` and reboot the app.")
+            else:
+                lime_weights = None
+                lime_pred = None
+                try:
+                    lime_explainer = load_lime_explainer(
+                        DATA_PATH if os.path.exists(DATA_PATH) else BG_PATH)
+                    lime_weights, lime_pred = lime_contribution(lime_explainer, x)
+                except Exception as exc:  # noqa: BLE001
+                    st.warning("⚠️ LIME could not explain this patient, but the SHAP "
+                               f"explanation above is unaffected. ({type(exc).__name__})")
+                    with st.expander("Technical details"):
+                        st.code(traceback.format_exc())
+
+                if lime_weights is not None:
+                    shap_by_feature = dict(zip(contrib["Feature"], contrib["Impact"]))
+                    shap_vec = np.array([float(shap_by_feature[f]) for f in FEATURES])
+                    lime_vec = lime_weights[FEATURES].to_numpy(dtype=float)
+
+                    rho = rank_correlation(shap_vec, lime_vec)
+                    shap_top = FEATURES[int(np.argmax(np.abs(shap_vec)))]
+                    lime_top = FEATURES[int(np.argmax(np.abs(lime_vec)))]
+                    top_shap = {FEATURES[i] for i in np.argsort(-np.abs(shap_vec))[:3]}
+                    top_lime = {FEATURES[i] for i in np.argsort(-np.abs(lime_vec))[:3]}
+                    overlap = len(top_shap & top_lime)
+
+                    a1, a2, a3 = st.columns(3)
+                    a1.metric(
+                        "Importance agreement",
+                        "n/a" if rho is None else f"{rho:+.2f}",
+                        help="Spearman correlation of the two importance rankings by "
+                             "absolute size. +1 means identical order, 0 means unrelated.")
+                    a2.metric(
+                        "Top-3 overlap", f"{overlap}/3",
+                        help="How many features appear in both methods' three strongest.")
+                    a3.metric(
+                        "Top driver",
+                        "agree" if shap_top == lime_top else "differs",
+                        help=f"SHAP: {short_label(shap_top)} · "
+                             f"LIME: {short_label(lime_top)}")
+
+                    bar_left, bar_right = st.columns(2, gap="large")
+                    with bar_left:
+                        render_contribution_bars(shap_vec, "SHAP")
+                    with bar_right:
+                        render_contribution_bars(lime_vec, "LIME")
+
+                    if rho is None:
+                        st.info("One of the methods produced no usable ranking for this "
+                                "patient, so their agreement cannot be scored.")
+                    elif rho >= 0.7:
+                        st.success(
+                            f"**The two methods largely agree** (importance correlation "
+                            f"{rho:+.2f}, {overlap} of 3 top drivers shared). The "
+                            "explanation does not depend on SHAP's particular assumptions.")
+                    elif rho >= 0.4:
+                        st.info(
+                            f"**Partial agreement** (importance correlation {rho:+.2f}, "
+                            f"{overlap} of 3 top drivers shared). The biggest drivers line "
+                            "up, but the methods disagree about some smaller factors.")
+                    else:
+                        st.warning(
+                            f"**The methods weight different features** (importance "
+                            f"correlation {rho:+.2f}, {overlap} of 3 top drivers shared). "
+                            "LIME fits a local surrogate, so in sparse regions it can latch "
+                            "onto a different pattern than the global SHAP decomposition. "
+                            "Treat features that both methods rank highly as the robust "
+                            "part of the story.")
+
+                    st.caption(
+                        f"LIME's local surrogate predicts **{lime_pred:.1%}** for this "
+                        f"patient (the full model says {risk:.1%}). Weight scales are not "
+                        "directly comparable, and the two methods answer slightly different "
+                        "questions: SHAP measures contribution **relative to the dataset "
+                        "average**, while LIME measures the local slope **around this "
+                        "patient**. That is why the ranking can agree while individual "
+                        "signs differ, especially for a patient close to the average.")
+
+                    with st.expander("🔍 Side-by-side importance table"):
+                        shap_rank = pd.Series(-np.abs(shap_vec)).rank().astype(int).to_numpy()
+                        lime_rank = pd.Series(-np.abs(lime_vec)).rank().astype(int).to_numpy()
+                        lime_table = pd.DataFrame({
+                            "Feature":   [FEATURE_INFO[f]["label"] for f in FEATURES],
+                            "Value":     [fmt_value(f, cleaned[f]) for f in FEATURES],
+                            "SHAP":      shap_vec.round(4),
+                            "LIME":      lime_vec.round(4),
+                            "SHAP rank": shap_rank,
+                            "LIME rank": lime_rank,
+                            "Direction": [
+                                "—" if abs(shap_vec[i]) < 1e-9 or abs(lime_vec[i]) < 1e-9
+                                else ("same" if np.sign(shap_vec[i]) == np.sign(lime_vec[i])
+                                      else "differs")
+                                for i in range(len(FEATURES))],
+                        }).sort_values("SHAP rank")
+                        st.dataframe(lime_table, hide_index=True,
+                                     use_container_width=True)
+                        st.caption("Direction compares the sign of the two weights: "
+                                   "'same' means both say the value raises (or both say it "
+                                   "lowers) risk. A sign difference is expected near the "
+                                   "average patient, where SHAP's baseline and LIME's local "
+                                   "neighbourhood are almost the same point.")
+
             st.markdown("---")
 
             # ── Global importance & beeswarm ───────────────────────────────
@@ -1326,6 +1705,163 @@ with tab2:
                                f"({type(exc).__name__}: {exc})")
                 finally:
                     plt.close(fig3)
+
+                # ── Stage 4: SHAP dependence for the top 3 features ─────────
+                st.markdown("---")
+                st.markdown("#### 📈 SHAP dependence — the three strongest features")
+                st.markdown(
+                    "Each dot is one background patient: the x-axis is the measured value, "
+                    "the y-axis is how much that value pushed that patient's prediction. A "
+                    "rising cloud means higher values raise risk, a flat cloud means the "
+                    "model barely reacts in that range. The black line is a rolling average "
+                    "and the red marker is this patient.")
+                imp_series = pd.Series(np.abs(gsv.values).mean(0), index=FEATURES)
+                top3 = list(imp_series.sort_values(ascending=False).head(3).index)
+                dep_cols = st.columns(3, gap="medium")
+                for dep_col, feature in zip(dep_cols, top3):
+                    idx = FEATURES.index(feature)
+                    xs = sample[feature].astype(float).to_numpy()
+                    ys = np.asarray(gsv.values)[:, idx]
+
+                    with dep_col:
+                        fig_dep, ax_dep = plt.subplots(figsize=(4.0, 3.0))
+                        ax_dep.scatter(xs, ys, s=22, alpha=0.7, color="#1f6feb",
+                                       edgecolor="white", linewidth=0.4)
+                        order = np.argsort(xs)
+                        window = max(4, len(xs) // 8)
+                        trend = pd.Series(ys[order]).rolling(
+                            window, center=True, min_periods=2).mean()
+                        ax_dep.plot(xs[order], trend, color="#111827", lw=1.6)
+                        ax_dep.axhline(0, color="#9aa3ad", lw=1)
+
+                        current = cleaned[feature]
+                        if pd.notna(current):
+                            nearest = int(np.argmin(np.abs(xs - float(current))))
+                            ax_dep.scatter([float(current)], [ys[nearest]], s=65,
+                                           color="#d64545", edgecolor="white",
+                                           linewidth=1.2, zorder=5)
+                            ax_dep.axvline(float(current), color="#d64545", ls="--", lw=1)
+
+                        ax_dep.set_title(short_label(feature), fontsize=10,
+                                         fontweight="bold")
+                        ax_dep.set_xlabel(FEATURE_INFO[feature]["label"], fontsize=7)
+                        ax_dep.set_ylabel("SHAP impact", fontsize=7)
+                        ax_dep.tick_params(labelsize=7)
+                        st.pyplot(fig_dep)
+                        plt.close(fig_dep)
+                        st.caption(f"Mean |SHAP| **{imp_series[feature]:.3f}** · "
+                                   f"{FEATURE_INFO[feature]['normal']}")
+
+                st.caption(
+                    "The shape matters more than the exact numbers: a step or a plateau is "
+                    "where the model stops treating the value as a graded risk factor. "
+                    "Dependence shows association learned from this dataset, not a "
+                    "biological dose-response curve.")
+
+                # ── Stage 4: two-feature interaction ────────────────────────
+                st.markdown("---")
+                st.markdown("#### 🧭 Feature interaction")
+                st.markdown(
+                    "A dependence plot holds every other value fixed. Here two features "
+                    "move together across a grid while the other six stay at this patient's "
+                    "values, so you can see whether one changes the effect of the other. "
+                    "The dark contour is the screening threshold.")
+                i1, i2 = st.columns(2)
+                with i1:
+                    f_x = st.selectbox(
+                        "Horizontal axis", FEATURES,
+                        index=FEATURES.index("Glucose"),
+                        format_func=lambda f: FEATURE_INFO[f]["label"],
+                        key="interact_x")
+                with i2:
+                    f_y = st.selectbox(
+                        "Vertical axis", FEATURES,
+                        index=FEATURES.index("BMI"),
+                        format_func=lambda f: FEATURE_INFO[f]["label"],
+                        key="interact_y")
+
+                if f_x == f_y:
+                    st.info("Choose two different features to see an interaction.")
+                else:
+                    try:
+                        grid_axis = {}
+                        for feature in (f_x, f_y):
+                            series = bg[feature]
+                            if feature in ZERO_AS_MISSING:
+                                series = series.replace(0, np.nan)
+                            observed = series.dropna()
+                            if observed.empty:
+                                observed = bg[feature]
+                            lo, hi = np.nanpercentile(observed, [1, 99])
+                            if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
+                                raise ValueError(f"no usable range for {feature}")
+                            grid_axis[feature] = np.linspace(float(lo), float(hi), 30)
+
+                        xs = grid_axis[f_x]
+                        ys = grid_axis[f_y]
+                        xx, yy = np.meshgrid(xs, ys)
+                        sweep = pd.DataFrame({
+                            feature: np.full(xx.size, float(cleaned[feature]))
+                            for feature in FEATURES})
+                        sweep[f_x] = xx.ravel()
+                        sweep[f_y] = yy.ravel()
+                        zz = model.predict_proba(sweep[FEATURES])[:, 1].reshape(xx.shape)
+
+                        fig_int, ax_int = plt.subplots(figsize=(7.2, 4))
+                        mesh = ax_int.contourf(xs, ys, zz, levels=20,
+                                               cmap="RdYlGn_r", vmin=0, vmax=1)
+                        ax_int.contour(xs, ys, zz, levels=[THRESHOLD],
+                                       colors="#111827", linewidths=2)
+                        ax_int.scatter([float(cleaned[f_x])],
+                                       [float(cleaned[f_y])],
+                                       s=70, color="#1f6feb", edgecolor="white",
+                                       zorder=5, label="This patient")
+                        ax_int.plot([], [], color="#111827", lw=2,
+                                    label=f"threshold {THRESHOLD:.2f}")
+                        fig_int.colorbar(mesh, ax=ax_int, label="Predicted risk")
+                        ax_int.set_xlabel(FEATURE_INFO[f_x]["label"], fontsize=8)
+                        ax_int.set_ylabel(FEATURE_INFO[f_y]["label"], fontsize=8)
+                        ax_int.tick_params(labelsize=8)
+                        ax_int.legend(fontsize=8, loc="best")
+                        st.pyplot(fig_int)
+                        plt.close(fig_int)
+
+                        # Interaction contrast on the four corners of the grid:
+                        # does the effect of X differ between low and high Y?
+                        effect_x_low_y = (zz[0, -1] - zz[0, 0]) * 100
+                        effect_x_high_y = (zz[-1, -1] - zz[-1, 0]) * 100
+                        interaction = effect_x_high_y - effect_x_low_y
+
+                        if abs(interaction) < 3:
+                            verdict = ("mostly **additive** — moving one of them shifts "
+                                       "risk by about the same amount whatever the other "
+                                       "is doing.")
+                        elif interaction > 0:
+                            verdict = (f"**synergistic** here: each extra unit of "
+                                       f"{short_label(f_x)} adds {interaction:.1f} more "
+                                       f"points of risk when {short_label(f_y)} is high "
+                                       "than when it is low.")
+                        else:
+                            verdict = (f"**offsetting** here: each extra unit of "
+                                       f"{short_label(f_x)} adds {abs(interaction):.1f} "
+                                       f"fewer points of risk when {short_label(f_y)} is "
+                                       "high than when it is low.")
+
+                        st.info(
+                            f"At the low end of {short_label(f_y)}, sweeping "
+                            f"{short_label(f_x)} across its observed range changes risk by "
+                            f"**{effect_x_low_y:+.1f} points**; at the high end it changes by "
+                            f"**{effect_x_high_y:+.1f} points**. The gap is "
+                            f"**{interaction:+.1f} points**, so the pair is {verdict}")
+                        st.caption(
+                            "Ranges run from the 1st to the 99th percentile of the "
+                            "background sample so a few outliers cannot flatten the colour "
+                            "scale. As with every what-if here, the other six values are "
+                            "held fixed — an interaction in the model, not proof of one in "
+                            "human physiology.")
+                    except Exception as exc:  # noqa: BLE001
+                        st.warning("⚠️ The interaction map could not be generated. "
+                                   f"({type(exc).__name__}: {exc})")
 
             st.markdown("---")
 
@@ -1572,6 +2108,195 @@ with tab4:
                 "Glucose and BMI tend to have the strongest correlation with diabetes outcome."
             )
             st.dataframe(d.corr(numeric_only=True).round(2), use_container_width=True)
+
+# ── Tab 5: Patient comparison ─────────────────────────────────────────────
+with tab5:
+    st.subheader("🆚 Patient Comparison")
+    st.markdown(
+        "Score a second patient profile against the one in the sidebar. **Patient A** is "
+        "the profile you have been editing; **Patient B** is entered independently here. "
+        "Use it to compare two people, or to see how far a patient would have to move to "
+        "reach someone else's risk profile.")
+
+    compare_on = st.toggle(
+        "Enable comparison mode", value=False, key="compare_mode",
+        help="Patient B gets its own eight measurements. Nothing here changes Patient A.")
+
+    if not compare_on:
+        st.info("Comparison mode is off. Turn it on to enter a second set of "
+                "measurements and see both patients side by side.")
+    else:
+        # Start Patient B as a healthier version of Patient A: every modifiable
+        # value that is above its healthy target is pre-filled at the target, so
+        # the comparison is immediately meaningful instead of two identical rows.
+        b_defaults = {}
+        for feature in FEATURES:
+            current = cleaned.get(feature)
+            if current is None or pd.isna(current):
+                current = MEDIANS.get(feature, 0.0)
+            current = float(current)
+            if feature in MODIFIABLE and current > float(MODIFIABLE[feature][0]):
+                current = float(MODIFIABLE[feature][0])
+            b_defaults[feature] = current
+
+        comparison_specs = {
+            "Pregnancies":              {"min_value": 0, "max_value": 20,
+                                         "step": 1, "format": "%d"},
+            "Glucose":                  {"min_value": 0, "max_value": 250,
+                                         "step": 1, "format": "%d"},
+            "BloodPressure":            {"min_value": 0, "max_value": 130,
+                                         "step": 1, "format": "%d"},
+            "SkinThickness":            {"min_value": 0, "max_value": 100,
+                                         "step": 1, "format": "%d"},
+            "Insulin":                  {"min_value": 0, "max_value": 850,
+                                         "step": 1, "format": "%d"},
+            "BMI":                      {"min_value": 0.0, "max_value": 70.0,
+                                         "step": 0.1, "format": "%.1f"},
+            "DiabetesPedigreeFunction": {"min_value": 0.05, "max_value": 2.5,
+                                         "step": 0.01, "format": "%.2f"},
+            "Age":                      {"min_value": 18, "max_value": 90,
+                                         "step": 1, "format": "%d"},
+        }
+
+        st.markdown("#### Patient B measurements")
+        st.caption("Patient B starts as Patient A with every modifiable value already at "
+                   "its healthy target. Change any field to compare a different profile.")
+        b_vals = {}
+        field_cols = st.columns(4, gap="medium")
+        for position, feature in enumerate(FEATURES):
+            spec = comparison_specs[feature]
+            value = b_defaults[feature]
+            if spec["format"] == "%d":
+                value = int(round(value))
+            with field_cols[position % 4]:
+                b_vals[feature] = st.number_input(
+                    short_label(feature), value=value, key=f"cmp_{feature}",
+                    help=FEATURE_INFO[feature]["help"], **spec)
+
+        b_cleaned, b_issues, b_missing = validate_inputs(b_vals, MEDIANS)
+
+        st.markdown("---")
+        risk_b = None
+        try:
+            xb = pd.DataFrame([b_cleaned])[FEATURES]
+            risk_b = min(max(float(model.predict_proba(xb)[0, 1]), 0.0), 1.0)
+        except Exception as exc:  # noqa: BLE001
+            st.error("❌ Patient B could not be scored. Patient A's result is unaffected.")
+            with st.expander("Technical details"):
+                st.code(traceback.format_exc())
+
+        if risk_b is not None:
+            level_a = risk_level(risk)
+            level_b = risk_level(risk_b)
+
+            col_a, col_b = st.columns(2, gap="large")
+
+            with col_a:
+                with st.container(border=True):
+                    st.markdown(f"#### Patient A · {level_a} risk")
+                    gauge_a = risk_gauge(risk, THRESHOLD, level_a)
+                    st.pyplot(gauge_a)
+                    plt.close(gauge_a)
+                    if risk >= THRESHOLD:
+                        st.error(f"Positive at the {THRESHOLD:.2f} threshold.")
+                    else:
+                        st.success(f"Negative at the {THRESHOLD:.2f} threshold.")
+                    if risk_interval:
+                        st.caption(f"90% interval: {risk_interval[0]:.1%} – "
+                                   f"{risk_interval[1]:.1%}")
+
+            with col_b:
+                with st.container(border=True):
+                    st.markdown(f"#### Patient B · {level_b} risk")
+                    gauge_b = risk_gauge(risk_b, THRESHOLD, level_b)
+                    st.pyplot(gauge_b)
+                    plt.close(gauge_b)
+                    if risk_b >= THRESHOLD:
+                        st.error(f"Positive at the {THRESHOLD:.2f} threshold.")
+                    else:
+                        st.success(f"Negative at the {THRESHOLD:.2f} threshold.")
+
+            gap = risk_b - risk
+            st.markdown("---")
+            gap_col, verdict_col = st.columns([1, 2.2], gap="large")
+            gap_col.metric("Difference (B − A)", f"{gap * 100:+.1f} pts")
+            gap_col.caption(f"Patient A: **{risk:.1%}** · Patient B: **{risk_b:.1%}**")
+            with verdict_col:
+                if abs(gap) < 0.005:
+                    st.info("The two profiles score almost identically.")
+                elif gap > 0:
+                    st.warning(
+                        f"Patient B is **{gap * 100:.1f} points higher** than Patient A.")
+                else:
+                    st.success(
+                        f"Patient B is **{abs(gap) * 100:.1f} points lower** than Patient A.")
+                if (risk >= THRESHOLD) != (risk_b >= THRESHOLD):
+                    lower_name = "B" if risk_b < risk else "A"
+                    st.caption(
+                        f"The screening call differs: Patient {lower_name} is the one "
+                        f"below the {THRESHOLD:.2f} threshold.")
+                if b_issues:
+                    st.caption("⚠️ Patient B has input warnings: "
+                               + "; ".join(message for _, message in b_issues))
+                if b_missing:
+                    st.caption("Patient B imputed: "
+                               + ", ".join(FEATURE_INFO[f]["label"] for f in b_missing))
+
+            st.markdown("#### Feature-by-feature difference")
+            diff_rows = []
+            for feature in FEATURES:
+                value_a = cleaned.get(feature)
+                value_b = b_cleaned.get(feature)
+                if value_a is None or pd.isna(value_a):
+                    value_a = MEDIANS.get(feature)
+                if value_b is None or pd.isna(value_b):
+                    value_b = MEDIANS.get(feature)
+                try:
+                    delta_value = float(value_b) - float(value_a)
+                    delta_text = f"{delta_value:+g}"
+                except (TypeError, ValueError):
+                    delta_text = "n/a"
+                diff_rows.append({
+                    "Feature":    FEATURE_INFO[feature]["label"],
+                    "Patient A":  fmt_value(feature, value_a),
+                    "Patient B":  fmt_value(feature, value_b),
+                    "B − A":      delta_text,
+                    "A status":   field_status(feature, value_a),
+                    "B status":   field_status(feature, value_b),
+                })
+            diff_df = pd.DataFrame(diff_rows)
+            st.dataframe(
+                diff_df.style.map(tint_status, subset=["A status", "B status"]),
+                hide_index=True, use_container_width=True)
+
+            st.markdown("---")
+            st.markdown("#### Top drivers for each patient")
+            if explainer is None:
+                st.caption("SHAP is unavailable, so the drivers cannot be listed. "
+                           "The scores and comparison above are unaffected.")
+            else:
+                driver_cols = st.columns(2, gap="large")
+                for column, name, frame in (
+                        (driver_cols[0], "Patient A", x),
+                        (driver_cols[1], "Patient B", xb)):
+                    with column:
+                        st.markdown(f"**{name}**")
+                        try:
+                            values = explainer(frame)
+                            vector = np.asarray(values.values)[0]
+                            order = np.argsort(-np.abs(vector))[:3]
+                            for idx in order:
+                                direction = "raises" if vector[idx] > 0 else "lowers"
+                                st.markdown(
+                                    f"- {short_label(FEATURES[idx])}: "
+                                    f"`{vector[idx]:+.3f}` ({direction} risk)")
+                        except Exception as exc:  # noqa: BLE001
+                            st.caption(f"Drivers unavailable ({type(exc).__name__}).")
+
+            st.caption(
+                "As everywhere else in this app, the scores are model estimates from eight "
+                "routine measurements, not diagnoses. A difference between two profiles "
+                "shows how the model responds to their inputs, not a treatment effect.")
 
 st.divider()
 st.caption(
