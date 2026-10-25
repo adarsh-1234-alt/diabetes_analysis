@@ -1,0 +1,16 @@
+[theme]
+# Pinned so the app looks the same on every machine and on Streamlit Cloud.
+# Without this, a viewer with dark mode gets dark cards behind light-themed
+# charts, which makes the gauge numbers and metric values unreadable.
+base = "light"
+primaryColor = "#1f6feb"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f6f8fa"
+textColor = "#1f2933"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false
