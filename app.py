@@ -43,14 +43,31 @@ Stage 4 notes
 * Patient comparison scores a second profile side by side with the sidebar one.
 * The recommendation engine ranks every modifiable value by how much risk it
   would remove if brought to its healthy target, plus the combined scenario.
+
+Stage 5 notes
+-------------
+* Saved predictions build a per-patient history with a risk-over-time chart.
+  History lives in Streamlit session state (in memory, per session) and can be
+  downloaded as CSV/JSON, so nothing is written to a database or file.
+* Batch prediction scores a whole CSV in one pass (capped at 2,000 rows) and
+  returns the same table plus a risk distribution and a downloadable result.
+* A one-click PDF report (reportlab, optional) packages the risk, measurements,
+  drivers, recommendations, flags and saved trend. If reportlab is missing the
+  app still works and says so.
+* Two explicit views: Patient view hides model internals and speaks in plain
+  language; Clinician view exposes SHAP/LIME, model performance, data explorer,
+  batch scoring and comparison.
 """
 import hmac
+import io
 import json
 import os
 import subprocess
 import sys
 import threading
 import traceback
+import uuid
+from datetime import datetime
 
 import joblib
 import sklearn
@@ -62,6 +79,15 @@ import numpy as np
 import pandas as pd
 import shap
 import streamlit as st
+
+# Make the sibling module importable no matter how the app was launched
+# (`streamlit run`, `python -m streamlit`, or Streamlit's AppTest runner).
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if _APP_DIR not in sys.path:
+    sys.path.insert(0, _APP_DIR)
+
+import report_utils
+from report_utils import PDF_OK, build_report_pdf, history_trend_figure
 
 try:  # optional: only needed if the saved model is an XGBoost pipeline
     import xgboost
@@ -481,6 +507,11 @@ def login():
 if not login():
     st.stop()
 
+# Stage 5 session state. `history` never leaves this browser session unless the
+# user downloads it from the history tab.
+st.session_state.setdefault("history", [])
+st.session_state.setdefault("last_label", "")
+
 
 # ── Stage 3: presentation layer ─────────────────────────────────────────────
 st.markdown(
@@ -825,6 +856,437 @@ def improvement_scenarios(cleaned_row, model_obj):
     return rows, combined_risk
 
 
+# ── Stage 5: saved history, batch scoring, reports, view modes ─────────────
+BATCH_LIMIT = 2000
+
+
+def make_history_record(risk, cleaned, missing_features, label, note=""):
+    """One saved prediction. Values are stored as plain floats (NaN → None)."""
+    return {
+        "id": uuid.uuid4().hex[:8],
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "label": (label or "").strip() or "Unnamed patient",
+        "risk": round(float(risk), 4),
+        "level": risk_level(risk),
+        "decision": "Positive" if risk >= THRESHOLD else "Negative",
+        "values": {
+            feature: (None if pd.isna(cleaned[feature]) else float(cleaned[feature]))
+            for feature in FEATURES
+        },
+        "missing": list(missing_features),
+        "note": (note or "").strip(),
+    }
+
+
+def history_frame(history):
+    """Display frame for saved records, newest first."""
+    rows = []
+    for record in reversed(history):
+        try:
+            when = datetime.fromisoformat(str(record["saved_at"]))
+            stamp = when.strftime("%d %b %Y, %H:%M")
+        except (TypeError, ValueError):
+            stamp = str(record.get("saved_at", ""))
+        rows.append({
+            "Saved": stamp,
+            "Patient": record.get("label", "Unnamed patient"),
+            "Risk": f"{float(record.get('risk', 0)):.1%}",
+            "Band": record.get("level", ""),
+            "Screening call": record.get("decision", ""),
+            "Note": record.get("note", ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def shap_drivers(row_frame, k=3):
+    """Top-k SHAP drivers as [(feature, value)], or None when unavailable."""
+    if explainer is None:
+        return None
+    values, _ = safe(lambda: explainer(row_frame), SHAP_ROW_TIMEOUT,
+                     "SHAP explanation for this patient")
+    if values is None:
+        return None
+    try:
+        vector = np.asarray(values.values)[0]
+        order = np.argsort(-np.abs(vector))[:k]
+        return [(FEATURES[i], float(vector[i])) for i in order]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def save_prediction_panel(risk, cleaned, missing_features, prefix):
+    """Save-to-history card used by the clinician view."""
+    with st.container(border=True):
+        st.markdown("#### 💾 Save this prediction")
+        st.caption("Kept in this app session's memory. Download the history from "
+                   "the History tab to keep a copy.")
+        label_col, note_col = st.columns([1, 2], gap="large")
+        label = label_col.text_input(
+            "Patient name or ID", value=st.session_state.get("last_label", ""),
+            key=f"{prefix}_save_label")
+        note = note_col.text_input(
+            "Note (optional)", key=f"{prefix}_save_note",
+            placeholder="e.g. repeat HbA1c in 3 months")
+        if st.button("Save to history", key=f"{prefix}_save_btn"):
+            final_label = (label.strip() or st.session_state.get("last_label")
+                           or "Unnamed patient")
+            st.session_state["last_label"] = final_label
+            st.session_state["history"].append(
+                make_history_record(risk, cleaned, missing_features,
+                                    final_label, note))
+            st.success(f"Saved **{final_label}** at **{risk:.1%}**. "
+                       "Open the History tab to see the trend.")
+
+
+def render_history(prefix, compact=False, only_label=None):
+    """History table, trend chart and export/delete controls."""
+    history = st.session_state.get("history", [])
+    if only_label:
+        history = [row for row in history if row.get("label") == only_label]
+    if not history:
+        st.info("No saved predictions yet. Save one and it will appear here "
+                "with a trend chart."
+                if not only_label else
+                f"No saved predictions for **{only_label}** yet.")
+        return
+
+    frame = history_frame(history)
+    if not compact:
+        filter_col, _ = st.columns([1, 2])
+        labels = sorted({row.get("label", "") for row in history})
+        chosen = filter_col.selectbox(
+            "Filter by patient", ["All patients"] + labels, key=f"{prefix}_filter")
+        if chosen != "All patients":
+            frame = frame[frame["Patient"] == chosen]
+            history = [row for row in history if row.get("label") == chosen]
+
+    patients = frame["Patient"].nunique()
+    if patients == 1 and len(frame) >= 2:
+        risks = [float(row["risk"]) for row in history]
+        latest, first = risks[-1], risks[0]
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Saved predictions", len(frame))
+        m2.metric("Latest risk", f"{latest:.1%}")
+        m3.metric("Change since first", f"{(latest - first) * 100:+.1f} pts")
+    else:
+        m1, m2 = st.columns(2)
+        m1.metric("Saved predictions", len(frame))
+        m2.metric("Patients tracked", patients)
+
+    st.markdown("#### Risk over time")
+    fig = history_trend_figure(
+        [{"saved_at": row.get("saved_at"), "risk": row.get("risk"),
+          "label": row.get("label")} for row in history],
+        threshold=THRESHOLD)
+    if fig is not None:
+        st.pyplot(fig)
+        plt.close(fig)
+    else:
+        st.caption("The saved timestamps could not be plotted.")
+
+    st.dataframe(frame, hide_index=True, use_container_width=True)
+
+    export_col, json_col = st.columns(2)
+    export_col.download_button(
+        "⬇️ History CSV", frame.to_csv(index=False).encode("utf-8"),
+        "patient_history.csv", "text/csv", key=f"{prefix}_csv")
+    json_col.download_button(
+        "⬇️ History JSON",
+        json.dumps(history, indent=2, ensure_ascii=False).encode("utf-8"),
+        "patient_history.json", "application/json", key=f"{prefix}_json")
+
+    if compact:
+        return
+
+    with st.expander("🗑️ Manage saved records"):
+        st.caption("Deleting a record cannot be undone. Downloads above are "
+                   "your permanent copy.")
+        entries = []
+        for record in reversed(history):
+            try:
+                stamp = datetime.fromisoformat(
+                    str(record["saved_at"])).strftime("%d %b %Y, %H:%M")
+            except (TypeError, ValueError):
+                stamp = str(record.get("saved_at", ""))
+            entries.append((f"{stamp} · {record.get('label', '')} · "
+                            f"{float(record.get('risk', 0)):.1%} · "
+                            f"#{record.get('id', '')}",
+                            record.get("id")))
+        mapping = dict(entries)
+        picked = st.multiselect("Records to delete", list(mapping),
+                                key=f"{prefix}_delete_pick")
+        confirm = st.checkbox("I understand these records will be removed",
+                              key=f"{prefix}_delete_confirm")
+        if st.button("Delete selected", key=f"{prefix}_delete_btn",
+                     disabled=not (picked and confirm)):
+            chosen_ids = {mapping[item] for item in picked}
+            st.session_state["history"] = [
+                row for row in st.session_state["history"]
+                if row.get("id") not in chosen_ids]
+            st.rerun()
+        if st.button("Clear all history", key=f"{prefix}_clear_btn",
+                     disabled=not confirm):
+            st.session_state["history"] = []
+            st.rerun()
+
+
+def normalise_batch(frame):
+    """Match CSV columns to FEATURES, coerce numbers and apply 0 → missing."""
+    data, missing_columns = {}, []
+    lookup = {str(column).strip().lower(): column for column in frame.columns}
+    for feature in FEATURES:
+        source = lookup.get(feature.lower())
+        if source is None:
+            missing_columns.append(feature)
+            data[feature] = pd.Series(np.nan, index=frame.index, dtype=float)
+        else:
+            data[feature] = pd.to_numeric(frame[source], errors="coerce")
+    normalised = pd.DataFrame(data)
+    for feature in ZERO_AS_MISSING:
+        normalised.loc[normalised[feature] == 0, feature] = np.nan
+    return normalised, missing_columns
+
+
+def batch_predict(frame, model_obj, limit=BATCH_LIMIT):
+    """Score a batch frame. Returns (results, probabilities, notes)."""
+    if frame is None or len(frame) == 0:
+        raise ValueError("The file has no rows to score.")
+    notes = []
+    if len(frame) > limit:
+        frame = frame.head(limit).copy()
+        notes.append(f"Only the first **{limit}** rows were scored; split larger "
+                     "files and run them in separate batches.")
+
+    normalised, missing_columns = normalise_batch(frame)
+    if missing_columns:
+        notes.append("These columns were absent and filled with the dataset "
+                     "median: **" + ", ".join(missing_columns) + "**.")
+    for feature in FEATURES:
+        if normalised[feature].isna().all():
+            normalised[feature] = ALL_MEDIANS[feature]
+
+    probabilities = np.asarray(
+        model_obj.predict_proba(normalised[FEATURES])[:, 1], dtype=float)
+    probabilities = np.clip(probabilities, 0.0, 1.0)
+
+    frame = frame.reset_index(drop=True)
+    results = pd.concat([
+        pd.DataFrame({
+            "Risk %": np.round(probabilities * 100, 1),
+            "Band": [risk_level(value) for value in probabilities],
+            "Screening call": [
+                "Positive" if value >= THRESHOLD else "Negative"
+                for value in probabilities],
+            "Missing labs": normalised[ZERO_AS_MISSING].isna().sum(
+                axis=1).astype(int).to_numpy(),
+        }, index=frame.index),
+        frame,
+    ], axis=1)
+    return results, probabilities, notes
+
+
+def render_report_section(prefix, *, risk, cleaned, interval, flags, drivers,
+                          default_label="", label_override=None):
+    """PDF preview + download. Shared by the clinician tab and patient view."""
+    st.markdown(
+        "The report packages the risk, the measurements, the main drivers, the "
+        "recommended next steps, clinical flags and any saved trend. It is a "
+        "screening summary to discuss with a clinician, not a diagnosis.")
+
+    if label_override is None:
+        label_col, note_col = st.columns([1, 2], gap="large")
+        label = label_col.text_input(
+            "Patient name or ID", value=default_label or st.session_state.get("last_label", ""),
+            key=f"{prefix}_label")
+        note = note_col.text_area(
+            "Clinician note for the report (optional)", key=f"{prefix}_note",
+            height=80, placeholder="Assessment, plan, follow-up…")
+        include_history = st.checkbox(
+            "Include saved progress chart", value=True,
+            key=f"{prefix}_include_history")
+    else:
+        label = label_override
+        note = st.text_area("Note for the report (optional)",
+                            key=f"{prefix}_note", height=80)
+        include_history = True
+
+    if not PDF_OK:
+        st.warning("⚠️ PDF export needs the `reportlab` package. Add "
+                   "`reportlab>=4.0.0` to `requirements.txt` and reboot the app.")
+        return
+
+    records = list(st.session_state.get("history", []))
+    wanted_label = label.strip() or "Unnamed patient"
+    records = [row for row in records if row.get("label") == wanted_label]
+    if not include_history:
+        records = []
+
+    rec_rows, combined_risk = improvement_scenarios(cleaned, model)
+    value_rows = [
+        (FEATURE_INFO[feature]["label"], fmt_value(feature, cleaned[feature]),
+         FEATURE_INFO[feature]["normal"], field_status(feature, cleaned[feature]))
+        for feature in FEATURES
+    ]
+    driver_rows = ([(FEATURE_INFO[feature]["label"], value)
+                    for feature, value in drivers]
+                   if drivers else None)
+    pdf_recs = [{
+        "feature": FEATURE_INFO[row["feature"]]["label"],
+        "current": row["current"],
+        "target": row["target"],
+        "unit": row["unit"],
+        "new_risk": row["new_risk"],
+    } for row in rec_rows]
+
+    generated = datetime.now()
+    try:
+        pdf_bytes = build_report_pdf(
+            label=label.strip() or "Unnamed patient",
+            risk=risk, level=risk_level(risk), threshold=THRESHOLD,
+            decision="Positive" if risk >= THRESHOLD else "Negative",
+            interval=interval, values=value_rows, rec_rows=pdf_recs,
+            combined_risk=combined_risk, flags=flags, drivers=driver_rows,
+            history_rows=records, note=note, model_name=meta.get("best_model", ""),
+            generated_at=generated)
+    except Exception:  # noqa: BLE001
+        st.error("❌ The PDF could not be generated. The risk score is unaffected.")
+        with st.expander("Technical details"):
+            st.code(traceback.format_exc())
+        return
+
+    if not pdf_bytes:
+        st.warning("⚠️ PDF export is unavailable in this environment.")
+        return
+
+    summary = st.columns(3)
+    summary[0].metric("Report risk", f"{risk:.1%}")
+    summary[1].metric("Band", risk_level(risk))
+    summary[2].metric("Saved visits in report", len(records))
+
+    slug = "".join(ch if ch.isalnum() else "_" for ch in (label or "patient"))
+    slug = slug.strip("_")[:40] or "patient"
+    st.download_button(
+        "⬇️ Download PDF report", pdf_bytes,
+        file_name=f"diabetes_report_{slug}_{generated:%Y%m%d_%H%M}.pdf",
+        mime="application/pdf", key=f"{prefix}_pdf")
+    st.caption(f"{len(pdf_bytes) / 1024:.0f} KB · generated "
+               f"{generated:%d %b %Y, %H:%M} · built in this session, "
+               "not stored on the server.")
+
+
+def render_patient_view(*, risk, cleaned, missing_features, interval, flags,
+                        rec_rows, combined_risk, drivers):
+    """Plain-language view: no model internals, no raw SHAP values."""
+    level = risk_level(risk)
+    name = st.text_input(
+        "Your name or ID (optional)", value=st.session_state.get("last_label", ""),
+        key="patient_name",
+        help="Used only to label your saved results and report. It is not sent anywhere.")
+    if name.strip():
+        st.session_state["last_label"] = name.strip()
+
+    st.markdown("### 👋 Your result")
+    left, right = st.columns([1, 1.2], gap="large")
+    with left:
+        with st.container(border=True):
+            fig = risk_gauge(risk, THRESHOLD, level)
+            st.pyplot(fig)
+            plt.close(fig)
+            if interval:
+                st.caption(
+                    f"People with very similar measurements scored between "
+                    f"**{interval[0]:.0%}** and **{interval[1]:.0%}**. That range "
+                    "is the honest uncertainty around this single number.")
+    with right:
+        with st.container(border=True):
+            st.markdown(f"## {level} risk")
+            st.markdown(
+                f"About **{risk * 100:.0f} in 100** people with measurements like "
+                "yours would be expected to have diabetes.")
+            if risk >= THRESHOLD:
+                st.warning(
+                    "Your result is at or above the screening cut-off. That is a "
+                    "reason to see a doctor for a confirmatory test — it is **not** "
+                    "a diagnosis.")
+            else:
+                st.success(
+                    "Your result is below the screening cut-off. Keep up your "
+                    "current habits, and re-screen if your measurements change.")
+            if missing_features:
+                st.caption(
+                    f"⚠️ {len(missing_features)} of the 8 measurements were not "
+                    "available, so this estimate is rougher than usual.")
+
+    st.markdown("#### What this number means")
+    st.markdown(
+        "- It is a **screening estimate** from eight routine measurements, not a "
+        "diagnosis.\n"
+        "- A lower score is reassuring but does **not** rule out diabetes.\n"
+        "- A higher score does **not** mean you have diabetes; it means a "
+        "confirmatory blood test is sensible.\n"
+        "- Risk changes as measurements change — that is why repeat screening "
+        "matters.")
+
+    st.markdown("#### 🎯 What you can do next")
+    actionable = [row for row in (rec_rows or [])
+                  if (risk - row["new_risk"]) * 100 > 0.05]
+    if actionable:
+        for row in actionable[:3]:
+            gain = (risk - row["new_risk"]) * 100
+            point_word = "point" if round(gain) == 1 else "points"
+            st.markdown(
+                f"- **{COMPACT_LABELS[row['feature']]}**: from "
+                f"{fmt_value(row['feature'], row['current'])} {row['unit']} to "
+                f"**{row['target']:g} {row['unit']}** — about "
+                f"**{gain:.0f} {point_word} lower** in this model.")
+        if combined_risk is not None:
+            st.caption(
+                f"If every target above is reached together, the estimate falls "
+                f"to about **{combined_risk:.0%}**. Treat that as an optimistic "
+                "ceiling, not a promise.")
+        st.caption("These are model estimates from changing one measurement at a "
+                   "time. Your clinician can turn them into a real care plan.")
+    else:
+        st.success("Every modifiable measurement is already in the healthy range. "
+                   "Maintaining these values is the best next step.")
+
+    with st.container(border=True):
+        st.markdown("#### 🩺 Worth mentioning to your doctor")
+        if flags:
+            for flag in flags:
+                st.markdown(f"- {flag}")
+        else:
+            st.caption("No clinical thresholds were exceeded in the values entered.")
+
+    st.markdown("---")
+    with st.container(border=True):
+        st.markdown("#### 💾 Save this result")
+        note = st.text_input("Add a note (optional)", key="patient_note",
+                             placeholder="e.g. after starting a new diet")
+        if st.button("Save to my progress", key="patient_save"):
+            final_label = (name.strip() or st.session_state.get("last_label")
+                           or "Unnamed patient")
+            st.session_state["last_label"] = final_label
+            st.session_state["history"].append(
+                make_history_record(risk, cleaned, missing_features,
+                                    final_label, note))
+            st.success(f"Saved at **{risk:.1%}**. Your progress chart now includes "
+                       "this visit.")
+
+    st.markdown("### 📈 Your progress")
+    render_history("patient_hist", compact=True,
+                   only_label=name.strip() if name.strip() else None)
+
+    st.markdown("### 📄 Your report")
+    render_report_section(
+        "patient_report", risk=risk, cleaned=cleaned, interval=interval,
+        flags=flags, drivers=drivers,
+        label_override=name.strip() or "Unnamed patient")
+
+    st.caption("This tool is for education and screening support only. It does "
+               "not replace a clinician's assessment or a laboratory diagnosis.")
+
+
 # ── Cached resources ─────────────────────────────────────────────────────────
 def needs_retrain():
     for path in (MODEL_PATH, METRICS_PATH, BG_PATH):
@@ -928,6 +1390,15 @@ MEDIANS = {
     for feature in ZERO_AS_MISSING
 }
 
+# Every feature median, used only to fill a batch column that is entirely blank
+# so the model pipeline always receives a usable frame.
+ALL_MEDIANS = {
+    feature: float(
+        bg[feature].replace(0, np.nan).median()
+        if feature in ZERO_AS_MISSING else bg[feature].median())
+    for feature in FEATURES
+}
+
 # ── Decision threshold (tuned for recall in train_model.py) ─────────────────
 THRESHOLD = float(meta["threshold"]) if meta.get("threshold") is not None else 0.5
 THRESHOLD_RULE = meta.get("threshold_rule", "default 0.50")
@@ -991,6 +1462,16 @@ def prediction_interval(x_row, risk, k=15):
 
 # ── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
+    mode = st.radio(
+        "View mode", ["Clinician", "Patient"], index=0, horizontal=True,
+        format_func=lambda value: "🩺 Clinician" if value == "Clinician" else "🙋 Patient",
+        help="Patient view hides the model internals and technical charts. "
+             "Clinician view adds SHAP/LIME, model performance, the data "
+             "explorer, batch scoring and side-by-side comparison.")
+    st.caption("Patient view: plain-language result and next steps. "
+               "Clinician view: the full technical workspace.")
+    st.markdown("---")
+
     st.header("🧑‍⚕️ Patient Information")
     st.caption("Match the controls to the patient's measurements. Every input is "
                "colour-coded: **green** normal, **amber** borderline, **red** abnormal.")
@@ -1072,18 +1553,26 @@ with st.sidebar:
         st.rerun()
 
 # ── Main ─────────────────────────────────────────────────────────────────────
-st.markdown('<h1 style="margin:0">🩺 Diabetes Risk Predictor</h1>',
+page_title = ("🩺 Your Diabetes Risk Results" if mode == "Patient"
+              else "🩺 Diabetes Risk Predictor")
+st.markdown(f'<h1 style="margin:0">{page_title}</h1>',
             unsafe_allow_html=True)
+mode_tag = "🙋 Patient view" if mode == "Patient" else "🩺 Clinician view"
+tags = (f'<span class="tag">{mode_tag}</span>'
+        f'<span class="tag">{meta.get("best_model", "unknown")}</span>'
+        f'<span class="tag">threshold {THRESHOLD:.2f}</span>')
+if mode == "Clinician":
+    tags += '<span class="tag">SHAP + LIME</span>'
 st.markdown(
     '<div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 4px 0">'
-    f'<span class="tag">{meta.get("best_model", "unknown")}</span>'
-    f'<span class="tag">threshold {THRESHOLD:.2f}</span>'
-    '<span class="tag">SHAP + LIME</span></div>',
+    + tags + '</div>',
     unsafe_allow_html=True,
 )
 st.caption(
-    "Estimates the likelihood of diabetes from eight routine measurements. "
-    "⚠️ Educational tool only — not a substitute for medical diagnosis.")
+    ("A screening estimate built from eight routine measurements, explained in "
+     "plain language. It is not a diagnosis." if mode == "Patient" else
+     "Estimates the likelihood of diabetes from eight routine measurements. "
+     "⚠️ Educational tool only — not a substitute for medical diagnosis."))
 
 
 x = pd.DataFrame([cleaned])[FEATURES]
@@ -1120,13 +1609,27 @@ if missing_features:
         f"{len(FEATURES)}** measured values — "
         f"{', '.join(missing_features)} were imputed.")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🔮 Risk Prediction",
-    "🧠 SHAP Explainability",
-    "📊 Model Performance",
-    "🔎 Data Explorer",
-    "🆚 Patient Comparison"
+# ── Patient view: a deliberately different surface, not a re-skin ──────────
+if mode == "Patient":
+    patient_recs, patient_combined = improvement_scenarios(cleaned, model)
+    render_patient_view(
+        risk=risk, cleaned=cleaned, missing_features=missing_features,
+        interval=risk_interval, flags=get_flags(cleaned),
+        rec_rows=patient_recs, combined_risk=patient_combined,
+        drivers=shap_drivers(x))
+    st.stop()
+
+tab1, tab2, tab3, tab4, tab5, tab_hist, tab_batch, tab_report = st.tabs([
+    "🔮 Risk",
+    "🧠 Explain",
+    "📊 Performance",
+    "🔎 Data",
+    "🆚 Compare",
+    "🗂️ History",
+    "📥 Batch",
+    "📄 Report",
 ])
+
 
 # ── Tab 1: Prediction ─────────────────────────────────────────────────────
 with tab1:
@@ -1422,6 +1925,9 @@ with tab1:
 
         st.dataframe(summary.style.map(_tint_status, subset=["Status"]),
                      hide_index=True, use_container_width=True)
+
+    st.markdown("---")
+    save_prediction_panel(risk, cleaned, missing_features, "clin")
 
 # ── Tab 2: SHAP Explainability ────────────────────────────────────────────
 with tab2:
@@ -2298,10 +2804,129 @@ with tab5:
                 "routine measurements, not diagnoses. A difference between two profiles "
                 "shows how the model responds to their inputs, not a treatment effect.")
 
+# ── Tab 6: Patient history ────────────────────────────────────────────────
+with tab_hist:
+    st.subheader("🗂️ Patient history")
+    st.markdown(
+        "Every prediction you save is kept **in this app session's memory** "
+        "(never written to a database or file) and plotted over time. Signing "
+        "out or closing the session clears it, so use the downloads to keep a "
+        "permanent copy or move records to another session.")
+    render_history("clin_hist")
+
+# ── Tab 7: Batch prediction ───────────────────────────────────────────────
+with tab_batch:
+    st.subheader("📥 Batch prediction")
+    st.markdown(
+        "Upload a CSV with one row per patient and the app scores the whole "
+        f"cohort in one pass (up to {BATCH_LIMIT:,} rows). Missing values and "
+        "clinical zeros are handled the same way as in the single-patient form. "
+        "Rows are scored independently — do not include an outcome column. "
+        "The file stays in session memory and is never written to disk.")
+    template = pd.DataFrame([{
+        "Pregnancies": 1, "Glucose": 120, "BloodPressure": 70,
+        "SkinThickness": 25, "Insulin": 80, "BMI": 28.0,
+        "DiabetesPedigreeFunction": 0.4, "Age": 35,
+    }])
+    st.download_button(
+        "⬇️ Download CSV template", template.to_csv(index=False).encode("utf-8"),
+        "diabetes_batch_template.csv", "text/csv", key="batch_template")
+    st.caption("Required columns: **" + ", ".join(FEATURES) + "**. A `0` in "
+               "Glucose, BloodPressure, SkinThickness, Insulin or BMI means "
+               "*not measured* and is imputed.")
+
+    uploaded = st.file_uploader(
+        "Upload patient CSV", type=["csv"], key="batch_upload",
+        help="One patient per row. Extra columns are preserved in the download.")
+    demo = st.checkbox(
+        "Use 20 example patients from the training data instead",
+        key="batch_demo")
+
+    frame = None
+    if uploaded is not None:
+        try:
+            frame = pd.read_csv(uploaded)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"❌ That file could not be read as CSV "
+                     f"(`{type(exc).__name__}`). Check the delimiter and header.")
+    elif demo:
+        try:
+            frame = load_data(DATA_PATH).head(20).drop(
+                columns=["Outcome"], errors="ignore")
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"❌ The example data could not be loaded "
+                     f"(`{type(exc).__name__}`).")
+
+    if frame is None:
+        st.info("Upload a CSV or tick the example box to see how batch scoring "
+                "works.")
+    else:
+        try:
+            results, probabilities, notes = batch_predict(frame, model)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"❌ The batch could not be scored "
+                     f"(`{type(exc).__name__}`). The single-patient form is "
+                     "unaffected.")
+            with st.expander("Technical details"):
+                st.code(traceback.format_exc())
+        else:
+            for note in notes:
+                st.warning(note)
+            total = len(results)
+            positives = int((probabilities >= THRESHOLD).sum())
+            high_band = sum(risk_level(value) == "High" for value in probabilities)
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Patients scored", f"{total:,}")
+            m2.metric("Positive at threshold", f"{positives:,}")
+            m3.metric("Mean risk", f"{probabilities.mean():.1%}")
+            m4.metric("High band", f"{high_band:,}")
+
+            if total >= 2:
+                fig_batch, ax_batch = plt.subplots(figsize=(7, 2.6))
+                bins = int(min(20, max(5, total // 2)))
+                ax_batch.hist(probabilities * 100, bins=bins, color="#1f6feb",
+                              alpha=0.75, edgecolor="white")
+                ax_batch.axvline(THRESHOLD * 100, color="#111827", ls="--",
+                                 lw=1.4)
+                ax_batch.text(THRESHOLD * 100 + 1.5,
+                              ax_batch.get_ylim()[1] * 0.92,
+                              f"threshold {THRESHOLD:.2f}", fontsize=7,
+                              color="#111827")
+                ax_batch.set_xlabel("Predicted risk (%)", fontsize=9)
+                ax_batch.set_ylabel("Patients", fontsize=9)
+                ax_batch.set_xlim(0, 100)
+                ax_batch.grid(axis="y", color="#eef1f4", lw=0.8)
+                ax_batch.set_axisbelow(True)
+                ax_batch.tick_params(labelsize=8)
+                for side in ("top", "right"):
+                    ax_batch.spines[side].set_visible(False)
+                fig_batch.tight_layout()
+                st.pyplot(fig_batch)
+                plt.close(fig_batch)
+
+            shown = results.head(200)
+            st.dataframe(shown, hide_index=True, use_container_width=True)
+            if total > len(shown):
+                st.caption(f"Showing the first {len(shown)} of {total:,} rows. "
+                           "The download contains every row.")
+            st.download_button(
+                "⬇️ Download results CSV",
+                results.to_csv(index=False).encode("utf-8"),
+                "batch_predictions.csv", "text/csv", key="batch_results_csv")
+
+# ── Tab 8: PDF report ─────────────────────────────────────────────────────
+with tab_report:
+    st.subheader("📄 PDF report")
+    render_report_section(
+        "clin_report", risk=risk, cleaned=cleaned, interval=risk_interval,
+        flags=get_flags(cleaned), drivers=shap_drivers(x),
+        default_label=st.session_state.get("last_label", ""))
+
 st.divider()
 st.caption(
     "Trained on the Pima Indians Diabetes Dataset (adult women of Pima heritage, aged 21+). "
     "Class imbalance handled with balanced class weights (no SMOTE). "
     "SHAP used for explainability; the decision threshold is tuned for high recall. "
+    "Saved predictions are kept in session memory only and reset on sign-out. "
     "This tool is for educational purposes only and is not a medical diagnosis."
 )
