@@ -3,8 +3,8 @@
 Runs the real Streamlit script in-process (all eight clinician tabs execute on
 every run) and checks input scenarios plus the Stage 2, 3, 4 and 5 features:
 threshold tuning, the uncertainty interval, the four-model comparison, the
-matplotlib gauge, colour-coded status pills, the before/after comparison, LIME
-vs SHAP agreement, SHAP dependence plots, the feature interaction map, the
+matplotlib gauge, colour-coded status pills, the before/after comparison,
+plain-language explanation cards, range bars, the try-change sentence, the
 recommendation engine, patient comparison, saved history, batch scoring, the
 PDF report and the patient/clinician view split.
 
@@ -60,7 +60,7 @@ def check_stage2(at, tag):
     checks = {
         "threshold shown":   "Screening threshold" in text,
         "interval shown":    "90% interval" in text,
-        "threshold section": "Decision Threshold Tuning" in text,
+        "threshold section": "Decision threshold tuning" in text,
         "xgboost listed":    "XGBoost" in text,
         "smote removed":     "SMOTE oversampling" not in text,
     }
@@ -101,15 +101,15 @@ def check_stage4(at, tag):
         "history tab":          any("History" in name for name in tab_labels),
         "batch tab":            any("Batch" in name for name in tab_labels),
         "report tab":           any("Report" in name for name in tab_labels),
-        "lime section":        "LIME" in text,
-        "dependence section":  "SHAP dependence" in text,
-        "interaction section": "Feature interaction" in text,
+        "explain headline":    any("Risk is" in s.value for s in at.subheader),
+        "raises cards":        "What raises this result" in text,
+        "lowers cards":        "What lowers it" in text,
+        "range bars":          "Where this patient sits" in text,
+        "try change":          "Try a change" in text,
         "recommendation":      ("What to improve first" in text
                                 and "Change this first" in labels),
         "comparison toggle":   len(at.toggle) == 1,
     }
-    if importlib.util.find_spec("lime") is not None:
-        checks["lime agreement"] = "Importance agreement" in labels
     bad = [name for name, ok in checks.items() if not ok]
     if bad:
         print(f"  STAGE4 FAIL: {bad}")
@@ -248,7 +248,7 @@ def stage5_flow():
         history_ok = (not at.exception
                       and len(at.session_state["history"]) == 1
                       and "Risk over time" in text
-                      and len(at.get("imgs")) >= 18)
+                      and len(at.get("imgs")) >= 4)
     except Exception as exc:  # noqa: BLE001
         print("  history flow error:", exc)
     results.append(("history save", history_ok))
@@ -276,7 +276,7 @@ def stage5_flow():
         patient_ok = (not at.exception
                       and len(at.tabs) == 0
                       and "Your result" in text
-                      and "SHAP dependence" not in text
+                      and "SHAP" not in text
                       and "LIME" not in text
                       and len(at.get("imgs")) >= 1
                       and any("Save to my progress" in button.label
@@ -328,6 +328,23 @@ def main():
     results.append(("threshold wired", f"{threshold:.2f}" in page_text(at)))
 
     results.extend(stage5_flow())
+
+    # New explain-tab checks (clinician view, default scenario)
+    at_explain = AppTest.from_file(APP, default_timeout=900)
+    at_explain.session_state["auth"] = True
+    at_explain.run()
+    explain_text = page_text(at_explain)
+    explain_ok = (
+        "Risk is" in explain_text
+        and "What raises this result" in explain_text
+        and "What lowers it" in explain_text
+        and "Where this patient sits" in explain_text
+        and "Try a change" in explain_text
+        and "How sure is this?" in explain_text
+        and "SHAP" not in explain_text
+        and "LIME" not in explain_text
+    )
+    results.append(("explain tab", explain_ok))
 
     # The login gate must still block unauthenticated users.
     at2 = AppTest.from_file(APP, default_timeout=900)
