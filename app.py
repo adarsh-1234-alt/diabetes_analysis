@@ -33,13 +33,8 @@ Stage 3 notes
 
 Stage 4 notes
 -------------
-* LIME runs next to SHAP on the same patient: two importance charts, a rank
-  correlation and a sign-agreement count make it obvious when the two methods
-  tell the same story and when they disagree.
-* SHAP dependence plots for the three globally strongest features show whether a
-  feature's effect is linear, saturating or non-monotone.
-* A two-feature interaction heat map sweeps both features at once, marks where
-  this patient sits and quantifies whether the pair behaves additively.
+* Plain-language explanations of the main drivers, using SHAP as a hidden engine.
+* A simple CSS range bar shows where the patient sits relative to normal bands.
 * Patient comparison scores a second profile side by side with the sidebar one.
 * The recommendation engine ranks every modifiable value by how much risk it
   would remove if brought to its healthy target, plus the combined scenario.
@@ -55,7 +50,7 @@ Stage 5 notes
   drivers, recommendations, flags and saved trend. If reportlab is missing the
   app still works and says so.
 * Two explicit views: Patient view hides model internals and speaks in plain
-  language; Clinician view exposes SHAP/LIME, model performance, data explorer,
+  language; Clinician view exposes explainability, model performance, data explorer,
   batch scoring and comparison.
 """
 import hmac
@@ -95,13 +90,6 @@ try:  # optional: only needed if the saved model is an XGBoost pipeline
 except Exception:  # noqa: BLE001
     XGBOOST_VERSION = None
 
-try:  # Stage 4: a second, model-agnostic explanation method.
-    from lime.lime_tabular import LimeTabularExplainer
-    LIME_OK = True
-except Exception:  # noqa: BLE001
-    LimeTabularExplainer = None
-    LIME_OK = False
-
 # ── Paths ───────────────────────────────────────────────────────────────────
 BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH   = os.path.join(BASE_DIR, "model.joblib")
@@ -113,7 +101,6 @@ TRAIN_SCRIPT = os.path.join(BASE_DIR, "train_model.py")
 TRAIN_TIMEOUT       = 600   # seconds before we give up on training
 SHAP_INIT_TIMEOUT   = 90
 SHAP_ROW_TIMEOUT    = 60
-SHAP_GLOBAL_TIMEOUT = 120
 
 LOGO_PATH = os.path.join(BASE_DIR, "logo.png")
 st.set_page_config(
@@ -813,96 +800,184 @@ def tint_status(value):
     return f"background-color: {tint}; color: {text}; font-weight: 600"
 
 
-def rank_correlation(a, b):
-    """Spearman rank correlation of *absolute* importance.
+def build_explanation(x, cleaned, risk):
+    """Plain-language explanation data using SHAP as a hidden engine.
 
-    SHAP and LIME measure importance on different scales and against different
-    reference points (dataset average vs local neighbourhood), so asking whether
-    they rank the features' magnitudes the same way is the fair comparison. The
-    sign of each weight is reported separately, feature by feature.
+    Returns a dict with headline, raises/lowers cards, range bars,
+    try-change sentence, how-sure text, and a warning list. No raw SHAP
+    values are exposed.
     """
-    a = pd.Series(np.abs(np.asarray(a, dtype=float))).rank().to_numpy()
-    b = pd.Series(np.abs(np.asarray(b, dtype=float))).rank().to_numpy()
-    if np.std(a) == 0 or np.std(b) == 0:
-        return None
-    return float(np.corrcoef(a, b)[0, 1])
+    headline_fallback = False
+    sv = None
+    if explainer is not None:
+        sv_result, err = safe(lambda: explainer(x), SHAP_ROW_TIMEOUT,
+                              "SHAP explanation for this patient")
+        if sv_result is not None:
+            try:
+                sv = np.asarray(sv_result.values)[0]
+            except Exception:
+                sv = None
 
+    # Fixed importance order for fallback
+    FIXED_ORDER = ["Glucose", "BMI", "Age", "Insulin", "BloodPressure",
+                   "SkinThickness", "DiabetesPedigreeFunction", "Pregnancies"]
 
-def render_contribution_bars(values, title):
-    """One horizontal importance chart, red = raises risk, blue = lowers it."""
-    values = np.asarray(values, dtype=float)
-    order = np.argsort(np.abs(values))
-    labels = [FEATURE_INFO[FEATURES[i]]["label"] for i in order]
-    ordered = values[order]
-    colours = ["#d64545" if value > 0 else "#1f6feb" for value in ordered]
-    span = max(float(np.abs(ordered).max()), 1e-9)
+    if sv is not None:
+        total_abs = float(np.sum(np.abs(sv))) + 1e-9
+        shares = np.abs(sv) / total_abs
+        features_in_order = list(np.argsort(-np.abs(sv)))
+        raises = []
+        lowers = []
+        strength_map = {}
+        for idx in features_in_order:
+            feat = FEATURES[idx]
+            share = float(shares[idx])
+            if share >= 0.35:
+                strength = "Strong"
+            elif share >= 0.15:
+                strength = "Moderate"
+            else:
+                strength = "Small"
+            strength_map[feat] = strength
+            status = field_status(feat, cleaned.get(feat))
+            value = float(x.iloc[0][feat]) if feat in x.columns else None
+            # Re-check missing from cleaned
+            actual_value = cleaned.get(feat)
+            is_missing = (feat in ZERO_AS_MISSING and (actual_value is None or (isinstance(actual_value, float) and np.isnan(actual_value)) or float(actual_value if actual_value is not None else -1) <= 0))
+            direction = "raises" if float(sv[idx]) > 0 else "lowers"
+            card = {
+                "feature": feat,
+                "label": FEATURE_INFO[feat]["label"],
+                "value": fmt_value(feat, actual_value) if not is_missing else "Not measured",
+                "status": status,
+                "strength": strength,
+                "direction": direction,
+                "sentence": (explain_missing(feat, MEDIANS.get(feat, 100))
+                              if is_missing else
+                              (explain_feature_up(feat, float(actual_value)) if direction == "raises" else explain_feature_down(feat, float(actual_value)))),
+                "imputed_note": ("Estimated, not measured — model filled in the median." if is_missing else ""),
+            }
+            if direction == "raises":
+                raises.append(card)
+            else:
+                lowers.append(card)
+        # Headline: top two drivers by |SHAP|
+        sorted_by_abs = sorted(features_in_order, key=lambda i: -abs(float(sv[i])))
+        top_two = [FEATURES[i] for i in sorted_by_abs[:2]]
+        headline = (f"Risk is {risk:.0%} ({risk_level(risk)}). "
+                    f"{FEATURE_INFO[top_two[0]]['label'].split(' (')[0]} and "
+                    f"{FEATURE_INFO[top_two[1]]['label'].split(' (')[0]} matter most for this result.")
+    else:
+        headline_fallback = True
+        # Fallback: fixed order + status-based direction
+        raises = []
+        lowers = []
+        strength_map = {}
+        for feat in FIXED_ORDER:
+            status = field_status(feat, cleaned.get(feat))
+            is_missing = feat in ZERO_AS_MISSING and (cleaned.get(feat) is None or (isinstance(cleaned.get(feat), float) and np.isnan(cleaned.get(feat))) or float(cleaned.get(feat) if cleaned.get(feat) is not None else -1) <= 0)
+            # Direction heuristic: abnormal / borderline / high value -> raises; else lowers
+            value = cleaned.get(feat)
+            try:
+                val_f = float(value) if value is not None and not np.isnan(value) else None
+            except Exception:
+                val_f = None
+            if is_missing:
+                direction = "raises"  # missing is treated cautiously as risk contributor
+            elif status in ("Abnormal", "Borderline"):
+                direction = "raises"
+            else:
+                direction = "lowers"
+            card = {
+                "feature": feat,
+                "label": FEATURE_INFO[feat]["label"],
+                "value": fmt_value(feat, value) if not is_missing else "Not measured",
+                "status": status,
+                "strength": "Moderate",
+                "direction": direction,
+                "sentence": (explain_missing(feat, MEDIANS.get(feat, 100))
+                              if is_missing else
+                              (explain_feature_up(feat, val_f) if direction == "raises" else explain_feature_down(feat, val_f))),
+                "imputed_note": ("Estimated, not measured — model filled in the median." if is_missing else ""),
+            }
+            strength_map[feat] = "Moderate"
+            if direction == "raises":
+                raises.append(card)
+            else:
+                lowers.append(card)
+        # Pick headline from first abnormal/borderline feature, else first in order
+        headline_features = [feat for feat in FIXED_ORDER if field_status(feat, cleaned.get(feat)) in ("Abnormal", "Borderline")]
+        if not headline_features:
+            headline_features = FIXED_ORDER[:2]
+        headline = (f"Risk is {risk:.0%} ({risk_level(risk)}). "
+                    f"{FEATURE_INFO[headline_features[0]]['label'].split(' (')[0]} and "
+                    f"{FEATURE_INFO[headline_features[1]]['label'].split(' (')[0]} are the key factors.")
 
-    fig, ax = plt.subplots(figsize=(6.2, 3.2))
-    ax.barh(labels, ordered, color=colours, height=0.65)
-    ax.axvline(0, color="#9aa3ad", lw=1)
-    for position, value in enumerate(ordered):
-        offset = 0.02 * span if value >= 0 else -0.02 * span
-        ax.text(value + offset, position, f"{value:+.3f}", va="center",
-                ha="left" if value >= 0 else "right",
-                fontsize=7, color="#1f2933")
-    ax.set_xlim(-span * 1.45, span * 1.45)
-    ax.set_title(title, fontsize=10)
-    ax.set_xlabel("impact on predicted risk", fontsize=8)
-    ax.tick_params(labelsize=7)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    fig.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
+    # Range bars for measurements
+    range_bars = {}
+    for feat in FEATURES:
+        value = cleaned.get(feat)
+        try:
+            val_f = float(value) if value is not None and not np.isnan(value) else None
+        except Exception:
+            val_f = None
+        if feat == "Glucose":
+            normal_low, normal_high = 70, 140
+        elif feat == "BMI":
+            normal_low, normal_high = 18.5, 24.9
+        elif feat == "BloodPressure":
+            normal_low, normal_high = 60, 80
+        elif feat == "SkinThickness":
+            normal_low, normal_high = 10, 30
+        elif feat == "Insulin":
+            normal_low, normal_high = 16, 166
+        elif feat == "Pregnancies":
+            normal_low, normal_high = 0, 5
+        elif feat == "DiabetesPedigreeFunction":
+            normal_low, normal_high = 0, 0.5
+        elif feat == "Age":
+            normal_low, normal_high = 21, 45
+        else:
+            normal_low, normal_high = 0, 1
+        range_bars[feat] = {
+            "label": FEATURE_INFO[feat]["label"],
+            "value": fmt_value(feat, value) if val_f is not None else "Not measured",
+            "normal_low": normal_low,
+            "normal_high": normal_high,
+            "current": val_f,
+        }
 
+    # How sure
+    interval_text = ""
+    # We'll return a simple text that the tab will format using prediction_interval
+    how_sure_text = "The model's estimate comes with a range of possible outcomes for similar patients."
 
-@st.cache_resource(show_spinner=False)
-def load_lime_explainer(path: str):
-    """Fit LIME on the full dataset when available, else the background sample.
+    # Try-change sentence (placeholder, the tab handles interaction)
+    try_change_sentence = "Changing one modifiable value can shift the estimated risk."
 
-    LIME needs a training distribution to draw neighbours from; the 100-row
-    background sample works but the full 768-row dataset gives a fuller
-    neighbourhood. `discretize_continuous=False` is deliberate: LIME's
-    discretiser fails on small samples (scipy truncnorm domain error) and plain
-    continuous features are easier to read in the chart.
-    """
-    frame = pd.read_csv(path)
-    training = frame[FEATURES].apply(pd.to_numeric, errors="coerce")
-    training = training.fillna(training.median())
-    return LimeTabularExplainer(
-        training.to_numpy(dtype=float),
-        feature_names=FEATURES,
-        class_names=["No diabetes", "Diabetes"],
-        mode="classification",
-        discretize_continuous=False,
-        random_state=42,
-    )
+    # Warning list
+    missing_features_local = []
+    for feat in ZERO_AS_MISSING:
+        v = cleaned.get(feat)
+        if v is None or (isinstance(v, float) and np.isnan(v)) or float(v if v is not None else -1) <= 0:
+            missing_features_local.append(feat)
 
+    warning_text = (f"{len(missing_features_local)} measurement(s) were not recorded and were estimated from the dataset median: "
+                    + ", ".join(FEATURE_INFO[f]["label"] for f in missing_features_local) + "."
+                    if missing_features_local else "All measurements were provided.")
 
-def lime_contribution(lime_explainer, row_frame):
-    """Local LIME weights for class 1, in FEATURES order, plus LIME's own risk.
-
-    LIME cannot ingest missing values, while the model pipeline imputes them
-    internally. Fill the "not measured" sentinels with the same training medians
-    the app already reports, so LIME explains the row the model actually scores.
-    """
-    frame = row_frame[FEATURES].astype(float).copy()
-    frame = frame.fillna(pd.Series(MEDIANS))   # DataFrame.fillna(Series) aligns on columns
-    values = frame.iloc[0].to_numpy(dtype=float)
-
-    def predict_fn(arr):
-        return np.asarray(
-            model.predict_proba(pd.DataFrame(arr, columns=FEATURES)), dtype=float)
-
-    explanation = lime_explainer.explain_instance(
-        values, predict_fn, labels=(1,), num_features=len(FEATURES),
-        num_samples=1000)
-    weights = dict(explanation.as_list(label=1))
-    series = pd.Series(
-        {feature: float(weights.get(feature, 0.0)) for feature in FEATURES},
-        dtype=float)
-    local_risk = float(explanation.predict_proba[1])
-    return series, local_risk
+    return {
+        "headline": headline,
+        "headline_fallback": headline_fallback,
+        "raises": raises[:3],
+        "lowers": lowers[:3],
+        "range_bars": range_bars,
+        "how_sure_text": how_sure_text,
+        "warning_text": warning_text,
+        "missing_features": missing_features_local,
+        "strength_map": strength_map,
+        "try_change_sentence": try_change_sentence,
+    }
 
 
 def improvement_scenarios(cleaned_row, model_obj):
@@ -1323,6 +1398,27 @@ def render_patient_view(*, risk, cleaned, missing_features, interval, flags,
                     f"{len(missing_features)} of the 8 measurements were not "
                     "available, so this estimate is rougher than usual.")
 
+    # Patient-view explanation section (reuses build_explanation, shorter wording)
+    try:
+        expl_pat = build_explanation(x, cleaned, risk)
+        st.markdown("---")
+        st.markdown("### Why this result")
+        st.markdown(
+            f"**Risk is {risk:.0%} ({risk_level(risk)}).** "
+            f"{expl_pat['headline'].replace('Glucose', 'blood sugar').replace('BMI', 'body weight index').replace('Age', 'age').lower()}"
+        )
+        for card in expl_pat["raises"][:2]:
+            with st.container(border=True):
+                st.markdown(f"**{card['label']}** · {card['value']} · {card['status']} · raises risk")
+                st.markdown(card["sentence"])
+        for card in expl_pat["lowers"][:2]:
+            with st.container(border=True):
+                st.markdown(f"**{card['label']}** · {card['value']} · {card['status']} · lowers risk")
+                st.markdown(card["sentence"])
+        st.caption("These are the main factors behind your screening estimate. Talk through any that concern you with your doctor.")
+    except Exception:
+        st.caption("A brief explanation of the main drivers is not available right now, but the risk score above is still valid.")
+
     st.markdown("#### What this number means")
     st.markdown(
         "- It is a **screening estimate** from eight routine measurements, not a "
@@ -1455,7 +1551,7 @@ def load():
 
     # SHAP is optional: if it fails or times out the rest of the app keeps working.
     explainer, explainer_error = None, None
-    with st.spinner("Preparing SHAP explainability…"):
+    with st.spinner("Preparing explainability engine…"):
         explainer, explainer_error = safe(
             lambda: shap.Explainer(predict_proba_fn, bg, feature_names=FEATURES),
             SHAP_INIT_TIMEOUT,
@@ -1468,24 +1564,6 @@ def load():
 @st.cache_data(show_spinner=False)
 def load_data(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
-
-
-_GLOBAL_SHAP = {"key": None, "value": None}
-
-
-def global_explanation(explainer, background: pd.DataFrame):
-    """Memoised global SHAP values.
-
-    Deliberately *not* decorated with st.cache_resource: this runs inside a
-    worker thread (see run_with_timeout) where Streamlit's cache has no script
-    context and would raise. A plain memo is thread-safe enough here because the
-    explainer object is stable for the lifetime of the cached model.
-    """
-    key = (id(explainer), len(background))
-    if _GLOBAL_SHAP["key"] != key:
-        _GLOBAL_SHAP["key"] = key
-        _GLOBAL_SHAP["value"] = explainer(background)
-    return _GLOBAL_SHAP["value"]
 
 
 model, meta, bg, explainer, explainer_error = load()
@@ -1572,7 +1650,7 @@ with st.sidebar:
         "View mode", ["Clinician", "Patient"], index=0, horizontal=True,
         format_func=lambda value: value,
         help="Patient view hides the model internals and technical charts. "
-             "Clinician view adds SHAP/LIME, model performance, the data "
+             "Clinician view adds explainability charts, model performance, the data "
              "explorer, batch scoring and side-by-side comparison.")
     st.caption("Patient view: plain-language result and next steps. "
                "Clinician view: the full technical workspace.")
@@ -2053,498 +2131,139 @@ with tab1:
     st.markdown("---")
     save_prediction_panel(risk, cleaned, missing_features, "clin")
 
-# ── Tab 2: SHAP Explainability ────────────────────────────────────────────
+# ── Tab 2: Explain (plain-language, SHAP hidden) ───────────────────────────
 with tab2:
-    st.subheader("Why did the model make this prediction?")
+    explanation_data = build_explanation(x, cleaned, risk)
+
+    st.subheader("Why this result")
+    level = risk_level(risk)
     st.markdown(
-        "This section uses **SHAP** (SHapley Additive exPlanations) to explain "
-        "exactly which factors are driving this prediction and by how much. "
-        "SHAP values are based on game theory — each feature gets a fair share of "
-        "credit or blame for the final prediction."
-    )
+        f'<div class="bandline" style="font-size:1.15rem;margin-bottom:8px;color:{BAND_COLOUR[level]}">'
+        f'<span class="banddot" style="background:{BAND_COLOUR[level]}"></span>'
+        f'{level} risk · {explanation_data["headline"]}</div>',
+        unsafe_allow_html=True)
 
-    if explainer is None:
-        st.error(
-            "**Explanations are temporarily unavailable — your risk score is unaffected.** "
-            "The SHAP explainer could not be created, most often because it timed out or "
-            "ran out of memory.")
-        st.caption(explainer_error or "No further details were captured.")
-        with st.expander("Technical details"):
-            st.code(explainer_error or "No error message was captured.")
-        if st.button("🔁 Try loading SHAP again", key="retry_shap"):
-            st.cache_resource.clear()
-            st.rerun()
-    else:
-        sv, shap_error = safe(lambda: explainer(x), SHAP_ROW_TIMEOUT,
-                              "SHAP explanation for this patient")
-
-        if sv is None:
-            st.warning(
-                "**This patient's SHAP explanation could not be computed in time.** "
-                "The risk score above is still valid. Try reloading the page.")
-            with st.expander("Technical details"):
-                st.code(shap_error)
+    col_raises, col_lowers = st.columns(2, gap="large")
+    with col_raises:
+        st.markdown("### What raises this result")
+        if not explanation_data["raises"]:
+            st.info("No single feature is strongly pushing risk upward.")
         else:
-            # ── Waterfall plot ──────────────────────────────────────────────
-            st.markdown("#### SHAP waterfall chart")
+            for card in explanation_data["raises"][:3]:
+                with st.container(border=True):
+                    header_lines = [
+                        f"**{card['label']}** · {card['value']}",
+                        f"<span style='font-size:.7rem;background:#f0f0f0;padding:1px 6px;border-radius:999px;'>{card['status']}</span>",
+                        f"· {card['strength']}"
+                    ]
+                    st.markdown(" ".join(header_lines), unsafe_allow_html=True)
+                    if card.get("imputed_note"):
+                        st.caption(card["imputed_note"])
+                    st.markdown(card["sentence"])
+
+    with col_lowers:
+        st.markdown("### What lowers it")
+        if not explanation_data["lowers"]:
+            st.info("No feature is clearly reducing risk here.")
+        else:
+            for card in explanation_data["lowers"][:3]:
+                with st.container(border=True):
+                    header_lines = [
+                        f"**{card['label']}** · {card['value']}",
+                        f"<span style='font-size:.7rem;background:#f0f0f0;padding:1px 6px;border-radius:999px;'>{card['status']}</span>",
+                        f"· {card['strength']}"
+                    ]
+                    st.markdown(" ".join(header_lines), unsafe_allow_html=True)
+                    if card.get("imputed_note"):
+                        st.caption(card["imputed_note"])
+                    st.markdown(card["sentence"])
+
+    st.markdown("---")
+    st.markdown("### Where this patient sits")
+    range_cols = st.columns(min(4, len(FEATURES)))
+    for idx, feat in enumerate(FEATURES):
+        rb = explanation_data["range_bars"][feat]
+        current_val = rb["current"]
+        max_display = max(rb["normal_high"], current_val if current_val else rb["normal_high"], rb["normal_low"] + 1)
+        left_pct = (current_val / max_display * 100) if current_val is not None else 0
+        with range_cols[idx % 4]:
+            with st.container(border=True):
+                st.caption(f"**{rb['label']}**")
+                bar_bg = (
+                    f'<div style="position:relative;height:22px;background:#eef1f4;'
+                    f'border-radius:8px;overflow:hidden;margin-top:4px;">'
+                    f'<div style="position:absolute;left:0;top:0;width:100%;height:100%;'
+                    f'background:linear-gradient(90deg, #e6f4ea 0%, #e6f4ea '
+                    f'{min(100, ((rb["normal_high"] / max_display) * 100))}%, #fde8e6 '
+                    f'{min(100, ((rb["normal_high"] / max_display) * 100))}%, #fde8e6 100%);'
+                    f'border-radius:8px;"></div>'
+                    f'<div style="position:absolute;left:{left_pct:.1f}%;top:5px;'
+                    f'width:3px;height:12px;background:#d64545;border-radius:2px;"></div>'
+                    f'</div>')
+                st.markdown(bar_bg, unsafe_allow_html=True)
+                st.caption(f"{rb['value']} · normal band shaded")
+
+    st.markdown("---")
+    st.markdown("### Try a change")
+    try_change_feature = st.selectbox(
+        "Which value to adjust?", list(MODIFIABLE.keys()),
+        format_func=lambda f: FEATURE_INFO[f]["label"], key="explain_modify")
+    target_val, target_unit, target_note = MODIFIABLE[try_change_feature]
+    current_for_change = cleaned.get(try_change_feature)
+    slider_key = f"try_change_{try_change_feature}"
+    if current_for_change is not None and not (isinstance(current_for_change, float) and np.isnan(current_for_change)):
+        adjusted = st.slider(
+            f"Move {FEATURE_INFO[try_change_feature]['label']} to",
+            min_value=float(target_val) - 30,
+            max_value=float(current_for_change) + 30,
+            value=float(current_for_change),
+            step=1.0 if try_change_feature in ("Pregnancies", "Age") else 0.1,
+            key=slider_key)
+    else:
+        adjusted = st.slider(
+            f"Move {FEATURE_INFO[try_change_feature]['label']} to",
+            min_value=float(target_val) - 30,
+            max_value=float(target_val) + 30,
+            value=float(target_val),
+            step=1.0 if try_change_feature in ("Pregnancies", "Age") else 0.1,
+            key=slider_key)
+
+    try:
+        changed = cleaned.copy()
+        changed[try_change_feature] = float(adjusted)
+        new_risk_change = float(model.predict_proba(pd.DataFrame([changed])[FEATURES])[0, 1])
+        new_risk_change = min(max(new_risk_change, 0.0), 1.0)
+        sentence = (f"Changing {FEATURE_INFO[try_change_feature]['label']} from "
+                    f"{fmt_value(try_change_feature, current_for_change) if current_for_change is not None else 'not measured'} "
+                    f"to **{adjusted:g} {target_unit}** moves the estimate from **{risk:.0%}** to **{new_risk_change:.0%}**.")
+    except Exception as exc:
+        sentence = f"Could not re-score this change ({type(exc).__name__})."
+    st.info(sentence)
+
+    st.markdown("---")
+    with st.container(border=True):
+        st.markdown("### How sure is this?")
+        if risk_interval:
+            low, high, neighbours = risk_interval
             st.markdown(
-                "This chart starts from the **average prediction** across all patients "
-                "and shows how each feature **pushes the risk up (red)** or **pulls it down (blue)** "
-                "to arrive at this patient's final predicted risk."
-            )
-            fig = plt.figure(figsize=(10, 5))
-            try:
-                shap.plots.waterfall(sv[0], show=False)
-                st.pyplot(fig)
-            except Exception as exc:  # noqa: BLE001
-                st.warning("The waterfall chart could not be drawn. "
-                           f"({type(exc).__name__}: {exc})")
-            finally:
-                plt.close(fig)
+                f"People with very similar measurements scored between **{low:.0%}** and **{high:.0%}**. "
+                f"That range ({neighbours} comparable patients) reflects how spread out the results are.")
+            if mode != "Patient" and low < THRESHOLD <= high:
+                st.warning("Borderline case: part of the interval straddles the screening threshold, so the positive/negative call is not clear-cut.")
+        else:
+            st.caption("An uncertainty range is not available for this profile.")
+        st.markdown(f"**{explanation_data['warning_text']}**")
+        if mode != "Patient":
+            st.caption(f"Screening threshold is **{THRESHOLD:.2f}**. Positive if risk is at or above it; negative below it.")
 
-            st.markdown("---")
-
-            # ── Plain English explanation ───────────────────────────────────
-            contrib = pd.DataFrame({
-                "Feature": FEATURES,
-                "Value":   x.iloc[0].values,
-                "Impact":  sv.values[0],
-            }).sort_values("Impact", key=abs, ascending=False)
-
-            top_pos = contrib[contrib["Impact"] > 0].head(4)
-            top_neg = contrib[contrib["Impact"] < 0].head(4)
-
-            st.markdown("#### Plain-English breakdown")
+    if mode == "Patient":
+        with st.container(border=True):
+            st.markdown("### Worth asking your doctor about")
             st.markdown(
-                "Below is a detailed explanation of what each factor means for this patient "
-                "and why it is increasing or decreasing the predicted risk."
-            )
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-                st.markdown("### 🔴 Factors increasing risk")
-                if top_pos.empty:
-                    st.success("No factors are significantly increasing risk.")
-                else:
-                    for _, row in top_pos.iterrows():
-                        feat   = row["Feature"]
-                        val    = row["Value"]
-                        impact = row["Impact"]
-                        desc   = (explain_missing(feat, MEDIANS.get(feat))
-                                  if pd.isna(val) else explain_feature_up(feat, val))
-                        with st.expander(f"**{FEATURE_INFO[feat]['label']}** · SHAP: `+{impact:.3f}`", expanded=True):
-                            st.markdown(desc)
-                            st.caption(f"Normal range: {FEATURE_INFO[feat]['normal']}")
-
-            with col2:
-                st.markdown("### 🔵 Factors decreasing risk")
-                if top_neg.empty:
-                    st.info("No factors are significantly decreasing risk.")
-                else:
-                    for _, row in top_neg.iterrows():
-                        feat   = row["Feature"]
-                        val    = row["Value"]
-                        impact = row["Impact"]
-                        desc   = (explain_missing(feat, MEDIANS.get(feat))
-                                  if pd.isna(val) else explain_feature_down(feat, val))
-                        with st.expander(f"**{FEATURE_INFO[feat]['label']}** · SHAP: `{impact:.3f}`", expanded=True):
-                            st.markdown(desc)
-                            st.caption(f"Normal range: {FEATURE_INFO[feat]['normal']}")
-
-            st.markdown("---")
-
-            # ── Full impact table ───────────────────────────────────────────
-            st.markdown("#### Complete feature impact table")
-            st.markdown(
-                "This table ranks all features by how strongly they influenced "
-                "this prediction. Positive impact = increases risk. Negative = reduces risk."
-            )
-            display_df = pd.DataFrame({
-                "Feature":      [FEATURE_INFO[f]["label"] for f in contrib["Feature"]],
-                "Your Value":   [fmt_value(f, v) for f, v in zip(contrib["Feature"], contrib["Value"])],
-                "SHAP Impact":  contrib["Impact"].round(4).values,
-                "Direction":    contrib["Impact"].apply(
-                    lambda v: "⬆️ Increases risk" if v > 0 else "⬇️ Reduces risk").values,
-                "Normal Range": [FEATURE_INFO[f]["normal"] for f in contrib["Feature"]],
-            })
-            st.dataframe(display_df, hide_index=True, use_container_width=True)
-
-            # ── Stage 4: LIME alongside SHAP ────────────────────────────────
-            st.markdown("---")
-            st.subheader("LIME — a second opinion")
-            st.markdown(
-                "SHAP explains this prediction by fairly distributing credit across the "
-                "features. **LIME** works differently: it perturbs this patient's values, "
-                "watches how the prediction moves, and fits a simple local model around "
-                "them. Because the two methods make different assumptions, comparing them "
-                "is a useful honesty check on the explanation.")
-
-            if not LIME_OK:
-                st.info("ℹ️ LIME is not installed in this deployment, so only SHAP is shown. "
-                        "Add `lime>=0.2.0.1` to `requirements.txt` and reboot the app.")
-            else:
-                lime_weights = None
-                lime_pred = None
-                try:
-                    lime_explainer = load_lime_explainer(
-                        DATA_PATH if os.path.exists(DATA_PATH) else BG_PATH)
-                    lime_weights, lime_pred = lime_contribution(lime_explainer, x)
-                except Exception as exc:  # noqa: BLE001
-                    st.warning("LIME could not explain this patient, but the SHAP "
-                               f"explanation above is unaffected. ({type(exc).__name__})")
-                    with st.expander("Technical details"):
-                        st.code(traceback.format_exc())
-
-                if lime_weights is not None:
-                    shap_by_feature = dict(zip(contrib["Feature"], contrib["Impact"]))
-                    shap_vec = np.array([float(shap_by_feature[f]) for f in FEATURES])
-                    lime_vec = lime_weights[FEATURES].to_numpy(dtype=float)
-
-                    rho = rank_correlation(shap_vec, lime_vec)
-                    shap_top = FEATURES[int(np.argmax(np.abs(shap_vec)))]
-                    lime_top = FEATURES[int(np.argmax(np.abs(lime_vec)))]
-                    top_shap = {FEATURES[i] for i in np.argsort(-np.abs(shap_vec))[:3]}
-                    top_lime = {FEATURES[i] for i in np.argsort(-np.abs(lime_vec))[:3]}
-                    overlap = len(top_shap & top_lime)
-
-                    a1, a2, a3 = st.columns(3)
-                    a1.metric(
-                        "Importance agreement",
-                        "n/a" if rho is None else f"{rho:+.2f}",
-                        help="Spearman correlation of the two importance rankings by "
-                             "absolute size. +1 means identical order, 0 means unrelated.")
-                    a2.metric(
-                        "Top-3 overlap", f"{overlap}/3",
-                        help="How many features appear in both methods' three strongest.")
-                    a3.metric(
-                        "Top driver",
-                        "agree" if shap_top == lime_top else "differs",
-                        help=f"SHAP: {short_label(shap_top)} · "
-                             f"LIME: {short_label(lime_top)}")
-
-                    bar_left, bar_right = st.columns(2, gap="large")
-                    with bar_left:
-                        render_contribution_bars(shap_vec, "SHAP")
-                    with bar_right:
-                        render_contribution_bars(lime_vec, "LIME")
-
-                    if rho is None:
-                        st.info("One of the methods produced no usable ranking for this "
-                                "patient, so their agreement cannot be scored.")
-                    elif rho >= 0.7:
-                        st.success(
-                            f"**The two methods largely agree** (importance correlation "
-                            f"{rho:+.2f}, {overlap} of 3 top drivers shared). The "
-                            "explanation does not depend on SHAP's particular assumptions.")
-                    elif rho >= 0.4:
-                        st.info(
-                            f"**Partial agreement** (importance correlation {rho:+.2f}, "
-                            f"{overlap} of 3 top drivers shared). The biggest drivers line "
-                            "up, but the methods disagree about some smaller factors.")
-                    else:
-                        st.warning(
-                            f"**The methods weight different features** (importance "
-                            f"correlation {rho:+.2f}, {overlap} of 3 top drivers shared). "
-                            "LIME fits a local surrogate, so in sparse regions it can latch "
-                            "onto a different pattern than the global SHAP decomposition. "
-                            "Treat features that both methods rank highly as the robust "
-                            "part of the story.")
-
-                    st.caption(
-                        f"LIME's local surrogate predicts **{lime_pred:.1%}** for this "
-                        f"patient (the full model says {risk:.1%}). Weight scales are not "
-                        "directly comparable, and the two methods answer slightly different "
-                        "questions: SHAP measures contribution **relative to the dataset "
-                        "average**, while LIME measures the local slope **around this "
-                        "patient**. That is why the ranking can agree while individual "
-                        "signs differ, especially for a patient close to the average.")
-
-                    with st.expander("🔍 Side-by-side importance table"):
-                        shap_rank = pd.Series(-np.abs(shap_vec)).rank().astype(int).to_numpy()
-                        lime_rank = pd.Series(-np.abs(lime_vec)).rank().astype(int).to_numpy()
-                        lime_table = pd.DataFrame({
-                            "Feature":   [FEATURE_INFO[f]["label"] for f in FEATURES],
-                            "Value":     [fmt_value(f, cleaned[f]) for f in FEATURES],
-                            "SHAP":      shap_vec.round(4),
-                            "LIME":      lime_vec.round(4),
-                            "SHAP rank": shap_rank,
-                            "LIME rank": lime_rank,
-                            "Direction": [
-                                "—" if abs(shap_vec[i]) < 1e-9 or abs(lime_vec[i]) < 1e-9
-                                else ("same" if np.sign(shap_vec[i]) == np.sign(lime_vec[i])
-                                      else "differs")
-                                for i in range(len(FEATURES))],
-                        }).sort_values("SHAP rank")
-                        st.dataframe(lime_table, hide_index=True,
-                                     use_container_width=True)
-                        st.caption("Direction compares the sign of the two weights: "
-                                   "'same' means both say the value raises (or both say it "
-                                   "lowers) risk. A sign difference is expected near the "
-                                   "average patient, where SHAP's baseline and LIME's local "
-                                   "neighbourhood are almost the same point.")
-
-            st.markdown("---")
-
-            # ── Global importance & beeswarm ───────────────────────────────
-            sample = bg.head(100).copy()
-            gsv, gsv_error = safe(
-                lambda: global_explanation(explainer, sample),
-                SHAP_GLOBAL_TIMEOUT, "Global SHAP values")
-
-            if gsv is None:
-                st.warning("Global feature importance could not be computed, "
-                           "but the patient-specific explanation above is unaffected.")
-                with st.expander("Technical details"):
-                    st.code(gsv_error)
-            else:
-                st.markdown("#### Global feature importance")
-                st.markdown(
-                    f"This chart shows which features matter **most on average across all "
-                    f"{len(sample)} sampled patients** in the training data — not just for this "
-                    "specific prediction. It gives a general picture of what drives diabetes "
-                    "risk in this dataset."
-                )
-                imp        = pd.Series(np.abs(gsv.values).mean(0), index=FEATURES).sort_values()
-                top_global = imp.idxmax()
-                fig2, ax   = plt.subplots(figsize=(8, 4))
-                imp.plot(kind="barh", ax=ax, color="steelblue")
-                ax.set_xlabel("Mean |SHAP value|")
-                ax.set_title("Global Feature Importance (mean absolute SHAP)")
-                st.pyplot(fig2)
-                plt.close(fig2)
-                st.info(
-                    f"**{FEATURE_INFO[top_global]['label']}** is the most important feature overall — "
-                    "it has the biggest average influence on diabetes predictions across "
-                    "all patients in the dataset.")
-
-                st.markdown("---")
-                st.markdown("#### SHAP beeswarm plot")
-                st.markdown(
-                    "Each dot is one patient from the background data. "
-                    "The color shows the feature value (red = high, blue = low). "
-                    "The position on the x-axis shows whether that value pushed risk up or down. "
-                    "This lets you see patterns across the whole dataset at once."
-                )
-                fig3 = plt.figure(figsize=(10, 5))
-                try:
-                    shap.plots.beeswarm(gsv, show=False)
-                    st.pyplot(fig3)
-                except Exception as exc:  # noqa: BLE001
-                    st.warning("The beeswarm plot could not be drawn. "
-                               f"({type(exc).__name__}: {exc})")
-                finally:
-                    plt.close(fig3)
-
-                # ── Stage 4: SHAP dependence for the top 3 features ─────────
-                st.markdown("---")
-                st.markdown("#### SHAP dependence — the three strongest features")
-                st.markdown(
-                    "Each dot is one background patient: the x-axis is the measured value, "
-                    "the y-axis is how much that value pushed that patient's prediction. A "
-                    "rising cloud means higher values raise risk, a flat cloud means the "
-                    "model barely reacts in that range. The black line is a rolling average "
-                    "and the red marker is this patient.")
-                imp_series = pd.Series(np.abs(gsv.values).mean(0), index=FEATURES)
-                top3 = list(imp_series.sort_values(ascending=False).head(3).index)
-                dep_cols = st.columns(3, gap="medium")
-                for dep_col, feature in zip(dep_cols, top3):
-                    idx = FEATURES.index(feature)
-                    xs = sample[feature].astype(float).to_numpy()
-                    ys = np.asarray(gsv.values)[:, idx]
-
-                    with dep_col:
-                        fig_dep, ax_dep = plt.subplots(figsize=(4.0, 3.0))
-                        ax_dep.scatter(xs, ys, s=22, alpha=0.7, color="#1f6feb",
-                                       edgecolor="white", linewidth=0.4)
-                        order = np.argsort(xs)
-                        window = max(4, len(xs) // 8)
-                        trend = pd.Series(ys[order]).rolling(
-                            window, center=True, min_periods=2).mean()
-                        ax_dep.plot(xs[order], trend, color="#111827", lw=1.6)
-                        ax_dep.axhline(0, color="#9aa3ad", lw=1)
-
-                        current = cleaned[feature]
-                        if pd.notna(current):
-                            nearest = int(np.argmin(np.abs(xs - float(current))))
-                            ax_dep.scatter([float(current)], [ys[nearest]], s=65,
-                                           color="#d64545", edgecolor="white",
-                                           linewidth=1.2, zorder=5)
-                            ax_dep.axvline(float(current), color="#d64545", ls="--", lw=1)
-
-                        ax_dep.set_title(short_label(feature), fontsize=10,
-                                         fontweight="bold")
-                        ax_dep.set_xlabel(FEATURE_INFO[feature]["label"], fontsize=7)
-                        ax_dep.set_ylabel("SHAP impact", fontsize=7)
-                        ax_dep.tick_params(labelsize=7)
-                        st.pyplot(fig_dep)
-                        plt.close(fig_dep)
-                        st.caption(f"Mean |SHAP| **{imp_series[feature]:.3f}** · "
-                                   f"{FEATURE_INFO[feature]['normal']}")
-
-                st.caption(
-                    "The shape matters more than the exact numbers: a step or a plateau is "
-                    "where the model stops treating the value as a graded risk factor. "
-                    "Dependence shows association learned from this dataset, not a "
-                    "biological dose-response curve.")
-
-                # ── Stage 4: two-feature interaction ────────────────────────
-                st.markdown("---")
-                st.markdown("#### Feature interaction")
-                st.markdown(
-                    "A dependence plot holds every other value fixed. Here two features "
-                    "move together across a grid while the other six stay at this patient's "
-                    "values, so you can see whether one changes the effect of the other. "
-                    "The dark contour is the screening threshold.")
-                i1, i2 = st.columns(2)
-                with i1:
-                    f_x = st.selectbox(
-                        "Horizontal axis", FEATURES,
-                        index=FEATURES.index("Glucose"),
-                        format_func=lambda f: FEATURE_INFO[f]["label"],
-                        key="interact_x")
-                with i2:
-                    f_y = st.selectbox(
-                        "Vertical axis", FEATURES,
-                        index=FEATURES.index("BMI"),
-                        format_func=lambda f: FEATURE_INFO[f]["label"],
-                        key="interact_y")
-
-                if f_x == f_y:
-                    st.info("Choose two different features to see an interaction.")
-                else:
-                    try:
-                        grid_axis = {}
-                        for feature in (f_x, f_y):
-                            series = bg[feature]
-                            if feature in ZERO_AS_MISSING:
-                                series = series.replace(0, np.nan)
-                            observed = series.dropna()
-                            if observed.empty:
-                                observed = bg[feature]
-                            lo, hi = np.nanpercentile(observed, [1, 99])
-                            if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
-                                raise ValueError(f"no usable range for {feature}")
-                            grid_axis[feature] = np.linspace(float(lo), float(hi), 30)
-
-                        xs = grid_axis[f_x]
-                        ys = grid_axis[f_y]
-                        xx, yy = np.meshgrid(xs, ys)
-                        sweep = pd.DataFrame({
-                            feature: np.full(xx.size, float(cleaned[feature]))
-                            for feature in FEATURES})
-                        sweep[f_x] = xx.ravel()
-                        sweep[f_y] = yy.ravel()
-                        zz = model.predict_proba(sweep[FEATURES])[:, 1].reshape(xx.shape)
-
-                        fig_int, ax_int = plt.subplots(figsize=(7.2, 4))
-                        mesh = ax_int.contourf(xs, ys, zz, levels=20,
-                                               cmap="RdYlGn_r", vmin=0, vmax=1)
-                        ax_int.contour(xs, ys, zz, levels=[THRESHOLD],
-                                       colors="#111827", linewidths=2)
-                        ax_int.scatter([float(cleaned[f_x])],
-                                       [float(cleaned[f_y])],
-                                       s=70, color="#1f6feb", edgecolor="white",
-                                       zorder=5, label="This patient")
-                        ax_int.plot([], [], color="#111827", lw=2,
-                                    label=f"threshold {THRESHOLD:.2f}")
-                        fig_int.colorbar(mesh, ax=ax_int, label="Predicted risk")
-                        ax_int.set_xlabel(FEATURE_INFO[f_x]["label"], fontsize=8)
-                        ax_int.set_ylabel(FEATURE_INFO[f_y]["label"], fontsize=8)
-                        ax_int.tick_params(labelsize=8)
-                        ax_int.legend(fontsize=8, loc="best")
-                        st.pyplot(fig_int)
-                        plt.close(fig_int)
-
-                        # Interaction contrast on the four corners of the grid:
-                        # does the effect of X differ between low and high Y?
-                        effect_x_low_y = (zz[0, -1] - zz[0, 0]) * 100
-                        effect_x_high_y = (zz[-1, -1] - zz[-1, 0]) * 100
-                        interaction = effect_x_high_y - effect_x_low_y
-
-                        if abs(interaction) < 3:
-                            verdict = ("mostly **additive** — moving one of them shifts "
-                                       "risk by about the same amount whatever the other "
-                                       "is doing.")
-                        elif interaction > 0:
-                            verdict = (f"**synergistic** here: each extra unit of "
-                                       f"{short_label(f_x)} adds {interaction:.1f} more "
-                                       f"points of risk when {short_label(f_y)} is high "
-                                       "than when it is low.")
-                        else:
-                            verdict = (f"**offsetting** here: each extra unit of "
-                                       f"{short_label(f_x)} adds {abs(interaction):.1f} "
-                                       f"fewer points of risk when {short_label(f_y)} is "
-                                       "high than when it is low.")
-
-                        st.info(
-                            f"At the low end of {short_label(f_y)}, sweeping "
-                            f"{short_label(f_x)} across its observed range changes risk by "
-                            f"**{effect_x_low_y:+.1f} points**; at the high end it changes by "
-                            f"**{effect_x_high_y:+.1f} points**. The gap is "
-                            f"**{interaction:+.1f} points**, so the pair is {verdict}")
-                        st.caption(
-                            "Ranges run from the 1st to the 99th percentile of the "
-                            "background sample so a few outliers cannot flatten the colour "
-                            "scale. As with every what-if here, the other six values are "
-                            "held fixed — an interaction in the model, not proof of one in "
-                            "human physiology.")
-                    except Exception as exc:  # noqa: BLE001
-                        st.warning("The interaction map could not be generated. "
-                                   f"({type(exc).__name__}: {exc})")
-
-            st.markdown("---")
-
-            # ── What-if analysis ────────────────────────────────────────────
-            st.markdown("#### What-if analysis")
-            st.markdown(
-                "Select a feature below to see how the predicted risk would change "
-                "if that value were different — while keeping everything else the same. "
-                "This helps identify which values the patient could realistically improve."
-            )
-            f_feat = st.selectbox("Choose a feature to vary", FEATURES, index=1)
-
-            observed = bg[f_feat].replace(0, np.nan).dropna()
-            if observed.empty:
-                st.info("Not enough data in the background sample to draw a what-if curve "
-                        "for this feature.")
-            else:
-                try:
-                    rng   = np.linspace(float(observed.min()), float(observed.max()), 50)
-                    sweep = pd.concat([x] * len(rng), ignore_index=True)
-                    sweep[f_feat] = rng
-                    risks_sweep = model.predict_proba(sweep)[:, 1]
-                    best_val    = rng[np.argmin(risks_sweep)]
-                    worst_val   = rng[np.argmax(risks_sweep)]
-
-                    fig4, ax4 = plt.subplots(figsize=(8, 3))
-                    ax4.plot(rng, risks_sweep, color="steelblue", linewidth=2)
-                    current = cleaned[f_feat]
-                    if pd.notna(current):
-                        ax4.axvline(current, color="red", ls="--",
-                                    label=f"Current: {current:g}")
-                    ax4.axvline(best_val, color="green", ls="--",
-                                label=f"Lowest risk: {best_val:.1f}")
-                    ax4.set_xlabel(FEATURE_INFO[f_feat]["label"])
-                    ax4.set_ylabel("Predicted Risk")
-                    ax4.set_title(f"How {f_feat} affects predicted diabetes risk")
-                    ax4.legend()
-                    st.pyplot(fig4)
-                    plt.close(fig4)
-
-                    current_txt = (
-                        "was not measured" if pd.isna(current)
-                        else f"is **{current:g}**")
-                    st.info(
-                        f"💡 **Insight:** The patient's current "
-                        f"**{FEATURE_INFO[f_feat]['label']}** {current_txt}. "
-                        f"The lowest predicted risk in the observed range occurs near "
-                        f"**{best_val:.1f}**, and the highest near **{worst_val:.1f}**. "
-                        f"Normal range for reference: {FEATURE_INFO[f_feat]['normal']}.")
-                except Exception as exc:  # noqa: BLE001
-                    st.warning("The what-if analysis could not be generated. "
-                               f"({type(exc).__name__}: {exc})")
-
+                "This is a screening estimate, not a diagnosis. If anything in the result worries you — "
+                "especially missing measurements or values marked abnormal — it is worth discussing with a clinician.")
+            if explanation_data["missing_features"]:
+                st.caption("Some inputs were estimated rather than measured. A real reading would make the result more reliable.")
 # ── Tab 3: Model Performance ──────────────────────────────────────────────
 with tab3:
     st.subheader("Model comparison")
@@ -2902,7 +2621,7 @@ with tab5:
             st.markdown("---")
             st.markdown("#### Top drivers for each patient")
             if explainer is None:
-                st.caption("SHAP is unavailable, so the drivers cannot be listed. "
+                st.caption("The explainability engine is unavailable, so the drivers cannot be listed. "
                            "The scores and comparison above are unaffected.")
             else:
                 driver_cols = st.columns(2, gap="large")
@@ -3050,7 +2769,7 @@ st.divider()
 st.caption(
     "Trained on the Pima Indians Diabetes Dataset (adult women of Pima heritage, aged 21+). "
     "Class imbalance handled with balanced class weights (no SMOTE). "
-    "SHAP used for explainability; the decision threshold is tuned for high recall. "
+    "An explainability engine is used for driver analysis; the decision threshold is tuned for high recall. "
     "Saved predictions are kept in session memory only and reset on sign-out. "
     "This tool is for educational purposes only and is not a medical diagnosis."
 )
