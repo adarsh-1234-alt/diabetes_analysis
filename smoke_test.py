@@ -1,11 +1,12 @@
 """Smoke test for the Diabetes Risk Predictor app.
 
-Runs the real Streamlit script in-process (all five tabs execute on every run)
-and checks input scenarios plus the Stage 2, 3 and 4 features: threshold tuning,
-the uncertainty interval, the four-model comparison, the matplotlib gauge, the
-colour-coded status pills, the before/after comparison, LIME vs SHAP agreement,
-SHAP dependence plots, the feature interaction map, the recommendation engine
-and patient comparison mode.
+Runs the real Streamlit script in-process (all eight clinician tabs execute on
+every run) and checks input scenarios plus the Stage 2, 3, 4 and 5 features:
+threshold tuning, the uncertainty interval, the four-model comparison, the
+matplotlib gauge, colour-coded status pills, the before/after comparison, LIME
+vs SHAP agreement, SHAP dependence plots, the feature interaction map, the
+recommendation engine, patient comparison, saved history, batch scoring, the
+PDF report and the patient/clinician view split.
 
 Usage:
     python smoke_test.py
@@ -22,6 +23,8 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 warnings.filterwarnings("ignore")
 
 from streamlit.testing.v1 import AppTest  # noqa: E402
+
+import report_utils  # noqa: E402
 
 APP = "app.py"
 METRICS = os.path.join(os.path.dirname(os.path.abspath(APP)), "metrics.json")
@@ -92,8 +95,12 @@ def check_stage4(at, tag):
     """Stage 4 assertions: LIME, dependence, interaction, recommendations."""
     text = page_text(at)
     labels = [metric.label for metric in at.metric]
+    tab_labels = [tab.label for tab in at.tabs]
     checks = {
-        "five tabs":           len(at.tabs) == 5,
+        "eight tabs":           len(at.tabs) == 8,
+        "history tab":          any("History" in name for name in tab_labels),
+        "batch tab":            any("Batch" in name for name in tab_labels),
+        "report tab":           any("Report" in name for name in tab_labels),
         "lime section":        "LIME" in text,
         "dependence section":  "SHAP dependence" in text,
         "interaction section": "Feature interaction" in text,
@@ -109,6 +116,24 @@ def check_stage4(at, tag):
     return not bad
 
 
+def check_stage5(at, tag):
+    """Stage 5 assertions that must hold in every clinician run."""
+    text = page_text(at)
+    buttons = [button.label for button in at.button]
+    checks = {
+        "save control":    any("Save to history" in label for label in buttons),
+        "batch section":   "Batch prediction" in text,
+        "pdf section":     "PDF report" in text,
+        "pdf built":       "Report risk" in [metric.label for metric in at.metric],
+        "no pdf error":    not any("PDF" in error.value for error in at.error),
+        "privacy note":    "session's memory" in text,
+    }
+    bad = [name for name, ok in checks.items() if not ok]
+    if bad:
+        print(f"  STAGE5 FAIL: {bad}")
+    return not bad
+
+
 def scenario(tag, mutate=None, assertions=None):
     at = AppTest.from_file(APP, default_timeout=900)
     at.session_state["auth"] = True
@@ -117,6 +142,7 @@ def scenario(tag, mutate=None, assertions=None):
     ok &= check_stage2(at, tag)
     ok &= check_stage3(at, tag)
     ok &= check_stage4(at, tag)
+    ok &= check_stage5(at, tag)
     if mutate:
         mutate(at)
         at.run()
@@ -124,6 +150,7 @@ def scenario(tag, mutate=None, assertions=None):
         ok &= check_stage2(at, tag)
         ok &= check_stage3(at, tag)
         ok &= check_stage4(at, tag)
+        ok &= check_stage5(at, tag)
         if assertions:
             ok &= assertions(at)
     return ok
@@ -204,6 +231,80 @@ def expects_same_feature_guard(at):
     return "Choose two different features" in page_text(at)
 
 
+def stage5_flow():
+    """Multi-step Stage 5 checks: save → batch → patient view → PDF bytes."""
+    results = []
+    at = AppTest.from_file(APP, default_timeout=900)
+    at.session_state["auth"] = True
+    at.run()
+
+    history_ok = False
+    try:
+        save = next(button for button in at.button
+                    if "Save to history" in button.label)
+        save.click()
+        at.run()
+        text = page_text(at)
+        history_ok = (not at.exception
+                      and len(at.session_state["history"]) == 1
+                      and "Risk over time" in text
+                      and len(at.get("imgs")) >= 18)
+    except Exception as exc:  # noqa: BLE001
+        print("  history flow error:", exc)
+    results.append(("history save", history_ok))
+
+    batch_ok = False
+    try:
+        demo = next(box for box in at.checkbox
+                    if "example patients" in box.label)
+        demo.set_value(True)
+        at.run()
+        labels = [metric.label for metric in at.metric]
+        batch_ok = (not at.exception
+                    and "Patients scored" in labels
+                    and any("Risk %" in list(getattr(frame.value, "columns", []))
+                            for frame in at.dataframe))
+    except Exception as exc:  # noqa: BLE001
+        print("  batch flow error:", exc)
+    results.append(("batch demo", batch_ok))
+
+    patient_ok = False
+    try:
+        at.radio[0].set_value("Patient")
+        at.run()
+        text = page_text(at)
+        patient_ok = (not at.exception
+                      and len(at.tabs) == 0
+                      and "Your result" in text
+                      and "SHAP dependence" not in text
+                      and "LIME" not in text
+                      and len(at.get("imgs")) >= 1
+                      and any("Save to my progress" in button.label
+                              for button in at.button))
+    except Exception as exc:  # noqa: BLE001
+        print("  patient flow error:", exc)
+    results.append(("patient view", patient_ok))
+
+    pdf_ok = False
+    try:
+        pdf = report_utils.build_report_pdf(
+            label="Smoke Test", risk=0.262, level="Low", threshold=0.30,
+            decision="Negative", interval=(0.03, 0.50),
+            values=[("Plasma Glucose (mg/dL)", "120", "Normal: <140 mg/dL",
+                     "Normal")],
+            rec_rows=[{"feature": "Plasma Glucose", "current": 120,
+                       "target": 100, "unit": "mg/dL", "new_risk": 0.152}],
+            flags=["Blood pressure >= 90 mm Hg - high"],
+            drivers=[("Plasma Glucose", 0.012)], history_rows=[])
+        pdf_ok = (not report_utils.PDF_OK) or (
+            pdf is not None and pdf[:5] == b"%PDF-" and len(pdf) > 2000)
+    except Exception as exc:  # noqa: BLE001
+        print("  pdf flow error:", exc)
+        pdf_ok = False
+    results.append(("pdf report", pdf_ok))
+    return results
+
+
 def main():
     with open(METRICS, encoding="utf-8") as handle:
         threshold = float(json.load(handle)["threshold"])
@@ -225,6 +326,8 @@ def main():
     at.session_state["auth"] = True
     at.run()
     results.append(("threshold wired", f"{threshold:.2f}" in page_text(at)))
+
+    results.extend(stage5_flow())
 
     # The login gate must still block unauthenticated users.
     at2 = AppTest.from_file(APP, default_timeout=900)
