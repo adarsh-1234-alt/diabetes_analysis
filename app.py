@@ -115,9 +115,10 @@ SHAP_INIT_TIMEOUT   = 90
 SHAP_ROW_TIMEOUT    = 60
 SHAP_GLOBAL_TIMEOUT = 120
 
+LOGO_PATH = os.path.join(BASE_DIR, "logo.png")
 st.set_page_config(
     page_title="Diabetes Risk Predictor",
-    page_icon="🩺",
+    page_icon=LOGO_PATH if os.path.exists(LOGO_PATH) else "🩺",
     layout="wide"
 )
 
@@ -480,27 +481,154 @@ def explain_missing(feat, median):
     )
 
 
+# ── Brand + presentation layer ─────────────────────────────────────────────
+APP_CSS = """
+<style>
+  .block-container { padding-top: 1.6rem; padding-bottom: 2.5rem; }
+
+  /* Product masthead */
+  .masthead {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 16px; flex-wrap: wrap; padding: 2px 0 15px;
+      border-bottom: 1px solid #eaecf0;
+  }
+  .masthead .brand { display: flex; align-items: center; gap: 14px; min-width: 0; }
+  .masthead .logo { width: 46px; height: 46px; flex: 0 0 46px; display: block;
+      filter: drop-shadow(0 2px 5px rgba(31,111,235,.18)); }
+  .eyebrow {
+      font-size: .65rem; font-weight: 700; letter-spacing: .14em;
+      text-transform: uppercase; color: #667085; margin-bottom: 2px;
+  }
+  .masthead h1.wordmark {
+      font-size: 1.58rem; line-height: 1.15; font-weight: 700;
+      letter-spacing: -.025em; color: #101828; margin: 0; padding: 0;
+  }
+  .mastline { font-size: .77rem; color: #667085; margin-top: 3px; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .chip {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: .71rem; font-weight: 600; color: #344054;
+      background: #f8fafc; border: 1px solid #e4e7ec;
+      border-radius: 999px; padding: 4px 10px; white-space: nowrap;
+  }
+  .chip.accent { background: #eef4ff; border-color: #d6e4ff; color: #1d4ed8; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: #12b76a;
+      box-shadow: 0 0 0 3px rgba(18,183,106,.12); }
+  .lede { font-size: .86rem; color: #475467; margin: 13px 0 8px; max-width: 840px; }
+  .bandline {
+      display: flex; align-items: center; gap: 8px;
+      font-size: 1.02rem; font-weight: 700; margin: -2px 0 3px;
+  }
+  .banddot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 9px; }
+  .bandcap { font-size: .78rem; color: #667085; margin-bottom: 10px; }
+
+  /* Sign-in surface */
+  .login-head { text-align: center; margin: 6vh 0 20px; }
+  .login-logo { display: flex; justify-content: center; margin-bottom: 13px; }
+  .login-head h1.login-title { font-size: 1.45rem; line-height: 1.25;
+      font-weight: 700; letter-spacing: -.02em; color: #101828;
+      margin: 0; padding: 0; }
+  .login-sub { font-size: .85rem; color: #667085; margin-top: 6px; }
+  .login-card-title { font-size: 1.02rem; font-weight: 700; color: #101828; }
+  .login-foot { text-align: center; font-size: .72rem; color: #98a2b3;
+      margin-top: 18px; }
+
+  /* Existing component polish */
+  div[data-testid="stMetric"] {
+      background: #ffffff; border: 1px solid #e6e9ee;
+      border-radius: 14px; padding: 14px 16px;
+  }
+  div[data-testid="stVerticalBlockBorderWrapper"] { border-radius: 14px; }
+  .pill {
+      display: inline-block; margin: -8px 0 10px 0; padding: 2px 10px;
+      border-radius: 999px; font-size: 0.70rem; font-weight: 600;
+      letter-spacing: 0.02em; border: 1px solid transparent;
+  }
+  .pill span { font-weight: 400; opacity: 0.8; margin-left: 6px; }
+  .tag {
+      font-size: 0.72rem; font-weight: 600; padding: 2px 9px;
+      border-radius: 999px; background: #eef1f4; color: #40474e;
+      border: 1px solid #dfe3e8;
+  }
+  button[data-baseweb="tab"] {
+      padding-left: 8px; padding-right: 8px; font-size: 0.85rem;
+  }
+
+  @media (max-width: 700px) {
+      .masthead h1.wordmark { font-size: 1.28rem; }
+      .masthead .logo { width: 40px; height: 40px; flex-basis: 40px; }
+      .login-head { margin-top: 3vh; }
+  }
+</style>
+"""
+st.markdown(APP_CSS, unsafe_allow_html=True)
+
+
+def brand_mark(size=46, uid="main"):
+    """Inline SVG logo: a glucose droplet with an ECG trace on a blue tile."""
+    return f"""
+    <svg width="{size}" height="{size}" viewBox="0 0 48 48" fill="none"
+         xmlns="http://www.w3.org/2000/svg" role="img"
+         aria-label="Diabetes Risk Predictor">
+      <defs>
+        <linearGradient id="logo-{uid}" x1="6" y1="4" x2="42" y2="46"
+                        gradientUnits="userSpaceOnUse">
+          <stop stop-color="#3B82F6"/>
+          <stop offset="1" stop-color="#1D4ED8"/>
+        </linearGradient>
+      </defs>
+      <rect width="48" height="48" rx="13" fill="url(#logo-{uid})"/>
+      <rect x="0.6" y="0.6" width="46.8" height="46.8" rx="12.6"
+            stroke="white" stroke-opacity="0.18"/>
+      <path d="M24 10.5c4.3 5.4 8.2 9.9 8.2 14.9a8.2 8.2 0 1 1-16.4 0c0-5 3.9-9.5 8.2-14.9Z"
+            fill="white" fill-opacity="0.95"/>
+      <path d="M18.2 25.4h3.7l1.8-3.9 2.7 6.9 1.9-3.9h2.4"
+            stroke="#1D4ED8" stroke-width="1.7" stroke-linecap="round"
+            stroke-linejoin="round"/>
+    </svg>
+    """
+
+
 # ── Auth ────────────────────────────────────────────────────────────────────
 def login():
     if st.session_state.get("auth"):
         return True
-    st.title("🩺 Diabetes Risk Predictor")
-    st.markdown("Please sign in to continue.")
-    with st.form("login"):
-        u  = st.text_input("Username")
-        p  = st.text_input("Password", type="password")
-        ok = st.form_submit_button("Sign in")
-    if ok:
-        try:
-            good_u = str(st.secrets["auth"]["username"])
-            good_p = str(st.secrets["auth"]["password"])
-        except Exception:
-            good_u, good_p = "admin", "smit123"
-        if hmac.compare_digest(u, good_u) and hmac.compare_digest(p, good_p):
-            st.session_state["auth"] = True
-            st.rerun()
-        else:
-            st.error("Invalid credentials")
+
+    _, middle, _ = st.columns([1, 1.55, 1])
+    with middle:
+        st.markdown(
+            f"""
+            <div class="login-head">
+              <div class="login-logo">{brand_mark(58, "login")}</div>
+              <h1 class="login-title">Diabetes Risk Predictor</h1>
+              <div class="login-sub">Clinical screening support for type 2 diabetes</div>
+            </div>
+            """,
+            unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown('<div class="login-card-title">Sign in</div>',
+                        unsafe_allow_html=True)
+            st.caption("Authorised clinical users only.")
+            with st.form("login", border=False):
+                u = st.text_input("Username", placeholder="e.g. clinician.name")
+                p = st.text_input("Password", type="password")
+                ok = st.form_submit_button("Sign in", type="primary",
+                                           use_container_width=True)
+        if ok:
+            try:
+                good_u = str(st.secrets["auth"]["username"])
+                good_p = str(st.secrets["auth"]["password"])
+            except Exception:
+                good_u, good_p = "admin", "smit123"
+            if hmac.compare_digest(u, good_u) and hmac.compare_digest(p, good_p):
+                st.session_state["auth"] = True
+                st.rerun()
+            else:
+                st.error("Invalid credentials")
+        st.markdown(
+            '<div class="login-foot">Educational screening aid &middot; '
+            "not a diagnosis</div>",
+            unsafe_allow_html=True)
     return False
 
 
@@ -513,33 +641,7 @@ st.session_state.setdefault("history", [])
 st.session_state.setdefault("last_label", "")
 
 
-# ── Stage 3: presentation layer ─────────────────────────────────────────────
-st.markdown(
-    """
-    <style>
-      .block-container { padding-top: 1.4rem; padding-bottom: 2.5rem; }
-      h1 { letter-spacing: -0.02em; font-size: 2.35rem; }
-      div[data-testid="stMetric"] {
-          background: #ffffff; border: 1px solid #e6e9ee;
-          border-radius: 14px; padding: 14px 16px;
-      }
-      div[data-testid="stVerticalBlockBorderWrapper"] { border-radius: 14px; }
-      .pill {
-          display: inline-block; margin: -8px 0 10px 0; padding: 2px 10px;
-          border-radius: 999px; font-size: 0.70rem; font-weight: 600;
-          letter-spacing: 0.02em; border: 1px solid transparent;
-      }
-      .pill span { font-weight: 400; opacity: 0.8; margin-left: 6px; }
-      .tag {
-          font-size: 0.72rem; font-weight: 600; padding: 2px 9px;
-          border-radius: 999px; background: #eef1f4; color: #40474e;
-          border: 1px solid #dfe3e8;
-      }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
+# --- Stage 3: shared presentation tokens -----------------------------------
 # Status colours: (text, tint). Used by pills, the gauge and the summary table.
 STATUS_STYLE = {
     "Normal":       ("#1a7f37", "#e6f4ea"),
@@ -917,7 +1019,7 @@ def shap_drivers(row_frame, k=3):
 def save_prediction_panel(risk, cleaned, missing_features, prefix):
     """Save-to-history card used by the clinician view."""
     with st.container(border=True):
-        st.markdown("#### 💾 Save this prediction")
+        st.markdown("#### Save this prediction")
         st.caption("Kept in this app session's memory. Download the history from "
                    "the History tab to keep a copy.")
         label_col, note_col = st.columns([1, 2], gap="large")
@@ -1111,7 +1213,7 @@ def render_report_section(prefix, *, risk, cleaned, interval, flags, drivers,
         include_history = True
 
     if not PDF_OK:
-        st.warning("⚠️ PDF export needs the `reportlab` package. Add "
+        st.warning("PDF export needs the `reportlab` package. Add "
                    "`reportlab>=4.0.0` to `requirements.txt` and reboot the app.")
         return
 
@@ -1155,7 +1257,7 @@ def render_report_section(prefix, *, risk, cleaned, interval, flags, drivers,
         return
 
     if not pdf_bytes:
-        st.warning("⚠️ PDF export is unavailable in this environment.")
+        st.warning("PDF export is unavailable in this environment.")
         return
 
     summary = st.columns(3)
@@ -1185,7 +1287,7 @@ def render_patient_view(*, risk, cleaned, missing_features, interval, flags,
     if name.strip():
         st.session_state["last_label"] = name.strip()
 
-    st.markdown("### 👋 Your result")
+    st.markdown("### Your result")
     left, right = st.columns([1, 1.2], gap="large")
     with left:
         with st.container(border=True):
@@ -1199,7 +1301,11 @@ def render_patient_view(*, risk, cleaned, missing_features, interval, flags,
                     "is the honest uncertainty around this single number.")
     with right:
         with st.container(border=True):
-            st.markdown(f"## {level} risk")
+            st.markdown(
+                f'<div class="bandline" style="font-size:1.45rem;'
+                f'margin:0 0 6px;color:{BAND_COLOUR[level]}">'
+                f'<span class="banddot" style="background:{BAND_COLOUR[level]}"></span>'
+                f'{level} risk</div>', unsafe_allow_html=True)
             st.markdown(
                 f"About **{risk * 100:.0f} in 100** people with measurements like "
                 "yours would be expected to have diabetes.")
@@ -1214,7 +1320,7 @@ def render_patient_view(*, risk, cleaned, missing_features, interval, flags,
                     "current habits, and re-screen if your measurements change.")
             if missing_features:
                 st.caption(
-                    f"⚠️ {len(missing_features)} of the 8 measurements were not "
+                    f"{len(missing_features)} of the 8 measurements were not "
                     "available, so this estimate is rougher than usual.")
 
     st.markdown("#### What this number means")
@@ -1227,7 +1333,7 @@ def render_patient_view(*, risk, cleaned, missing_features, interval, flags,
         "- Risk changes as measurements change — that is why repeat screening "
         "matters.")
 
-    st.markdown("#### 🎯 What you can do next")
+    st.markdown("#### What you can do next")
     actionable = [row for row in (rec_rows or [])
                   if (risk - row["new_risk"]) * 100 > 0.05]
     if actionable:
@@ -1251,7 +1357,7 @@ def render_patient_view(*, risk, cleaned, missing_features, interval, flags,
                    "Maintaining these values is the best next step.")
 
     with st.container(border=True):
-        st.markdown("#### 🩺 Worth mentioning to your doctor")
+        st.markdown("#### Worth mentioning to your doctor")
         if flags:
             for flag in flags:
                 st.markdown(f"- {flag}")
@@ -1260,7 +1366,7 @@ def render_patient_view(*, risk, cleaned, missing_features, interval, flags,
 
     st.markdown("---")
     with st.container(border=True):
-        st.markdown("#### 💾 Save this result")
+        st.markdown("#### Save this result")
         note = st.text_input("Add a note (optional)", key="patient_note",
                              placeholder="e.g. after starting a new diet")
         if st.button("Save to my progress", key="patient_save"):
@@ -1273,11 +1379,11 @@ def render_patient_view(*, risk, cleaned, missing_features, interval, flags,
             st.success(f"Saved at **{risk:.1%}**. Your progress chart now includes "
                        "this visit.")
 
-    st.markdown("### 📈 Your progress")
+    st.markdown("### Your progress")
     render_history("patient_hist", compact=True,
                    only_label=name.strip() if name.strip() else None)
 
-    st.markdown("### 📄 Your report")
+    st.markdown("### Your report")
     render_report_section(
         "patient_report", risk=risk, cleaned=cleaned, interval=interval,
         flags=flags, drivers=drivers,
@@ -1327,7 +1433,7 @@ def load():
             except TrainingError as exc:
                 st.error(f"❌ Model training failed.\n\n{exc}")
                 st.stop()
-        st.success("✅ Model trained and saved.")
+        st.success("Model trained and saved.")
 
     try:
         model = joblib.load(MODEL_PATH)
@@ -1464,7 +1570,7 @@ def prediction_interval(x_row, risk, k=15):
 with st.sidebar:
     mode = st.radio(
         "View mode", ["Clinician", "Patient"], index=0, horizontal=True,
-        format_func=lambda value: "🩺 Clinician" if value == "Clinician" else "🙋 Patient",
+        format_func=lambda value: value,
         help="Patient view hides the model internals and technical charts. "
              "Clinician view adds SHAP/LIME, model performance, the data "
              "explorer, batch scoring and side-by-side comparison.")
@@ -1472,7 +1578,7 @@ with st.sidebar:
                "Clinician view: the full technical workspace.")
     st.markdown("---")
 
-    st.header("🧑‍⚕️ Patient Information")
+    st.header("Patient information")
     st.caption("Match the controls to the patient's measurements. Every input is "
                "colour-coded: **green** normal, **amber** borderline, **red** abnormal.")
     st.markdown("---")
@@ -1530,49 +1636,65 @@ with st.sidebar:
     elif tally.get("Borderline"):
         st.warning(f"▲ {tally['Borderline']} borderline value(s) entered.")
     else:
-        st.success("✅ All entered values are in the normal band.")
+        st.success("All entered values are in the normal band.")
 
     st.markdown("---")
-    st.markdown("**🩺 Input checks**")
+    st.markdown("**Input checks**")
     if issues:
         for level, message in issues:
             {"warning": st.warning, "error": st.error, "info": st.info}[level](message)
     else:
         st.caption("No implausible or missing measurements detected.")
 
-    with st.expander("📋 Reference ranges"):
+    with st.expander("Reference ranges"):
         for feature in FEATURES:
             st.caption(f"**{feature}**: {FEATURE_INFO[feature]['normal']}")
 
     st.markdown("---")
     st.caption(f"Model in use: **{meta.get('best_model', 'unknown')}** · "
                f"decision threshold **{THRESHOLD:.2f}**")
-    if st.button("🚪 Sign out"):
+    if st.button("Sign out"):
         st.session_state.clear()
         st.cache_resource.clear()
         st.rerun()
 
 # ── Main ─────────────────────────────────────────────────────────────────────
-page_title = ("🩺 Your Diabetes Risk Results" if mode == "Patient"
-              else "🩺 Diabetes Risk Predictor")
-st.markdown(f'<h1 style="margin:0">{page_title}</h1>',
-            unsafe_allow_html=True)
-mode_tag = "🙋 Patient view" if mode == "Patient" else "🩺 Clinician view"
-tags = (f'<span class="tag">{mode_tag}</span>'
-        f'<span class="tag">{meta.get("best_model", "unknown")}</span>'
-        f'<span class="tag">threshold {THRESHOLD:.2f}</span>')
-if mode == "Clinician":
-    tags += '<span class="tag">SHAP + LIME</span>'
+if mode == "Patient":
+    eyebrow = "Patient summary"
+    heading = "Your diabetes risk results"
+    mastline = ("Eight routine measurements &middot; plain-language summary")
+    chips = ('<span class="chip accent">Screening estimate</span>'
+             '<span class="chip">Not a diagnosis</span>')
+    lede = ("This page turns your eight routine measurements into a plain-language "
+            "estimate of diabetes risk. It supports a conversation with your "
+            "clinician.")
+else:
+    eyebrow = "Clinical screening support"
+    heading = "Diabetes Risk Predictor"
+    mastline = ("Eight routine measurements &middot; recall-tuned screening")
+    chips = (f'<span class="chip accent"><span class="dot"></span>Clinician workspace</span>'
+             f'<span class="chip">{meta.get("best_model", "unknown")}</span>'
+             f'<span class="chip">Threshold {THRESHOLD:.2f}</span>')
+    lede = ("Estimates diabetes risk from eight routine measurements and shows "
+            "why. Educational screening support — not a diagnosis.")
+
 st.markdown(
-    '<div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 4px 0">'
-    + tags + '</div>',
+    f"""
+    <div class="masthead">
+      <div class="brand">
+        <div class="logo">{brand_mark(46, "main")}</div>
+        <div>
+          <div class="eyebrow">{eyebrow}</div>
+          <h1 class="wordmark">{heading}</h1>
+          <div class="mastline">{mastline}</div>
+        </div>
+      </div>
+      <div class="chips">{chips}</div>
+    </div>
+    <div class="lede">{lede}</div>
+    """,
     unsafe_allow_html=True,
 )
-st.caption(
-    ("A screening estimate built from eight routine measurements, explained in "
-     "plain language. It is not a diagnosis." if mode == "Patient" else
-     "Estimates the likelihood of diabetes from eight routine measurements. "
-     "⚠️ Educational tool only — not a substitute for medical diagnosis."))
 
 
 x = pd.DataFrame([cleaned])[FEATURES]
@@ -1587,7 +1709,7 @@ except Exception as exc:
         st.stop()
 
     st.session_state["_retrain_attempts"] = st.session_state.get("_retrain_attempts", 0) + 1
-    st.warning("⚠️ The saved model didn't match these inputs (`"
+    st.warning("The saved model didn't match these inputs (`"
                f"{type(exc).__name__}`). Retraining automatically…")
     with st.spinner("Retraining the model — about 60 seconds…"):
         try:
@@ -1605,7 +1727,7 @@ risk_interval = prediction_interval(x, risk)
 
 if missing_features:
     st.caption(
-        f"⚠️ This prediction uses **{len(FEATURES) - len(missing_features)} of "
+        f"This prediction uses **{len(FEATURES) - len(missing_features)} of "
         f"{len(FEATURES)}** measured values — "
         f"{', '.join(missing_features)} were imputed.")
 
@@ -1620,22 +1742,20 @@ if mode == "Patient":
     st.stop()
 
 tab1, tab2, tab3, tab4, tab5, tab_hist, tab_batch, tab_report = st.tabs([
-    "🔮 Risk",
-    "🧠 Explain",
-    "📊 Performance",
-    "🔎 Data",
-    "🆚 Compare",
-    "🗂️ History",
-    "📥 Batch",
-    "📄 Report",
+    "Risk",
+    "Explain",
+    "Performance",
+    "Data",
+    "Compare",
+    "History",
+    "Batch",
+    "Report",
 ])
 
 
 # ── Tab 1: Prediction ─────────────────────────────────────────────────────
 with tab1:
     level = "Low" if risk < .3 else "Moderate" if risk < .6 else "High"
-    color = "green" if risk < .3 else "orange" if risk < .6 else "red"
-    icon = "✅" if risk < .3 else "⚠️" if risk < .6 else "🚨"
 
     left, right = st.columns([1.15, 1], gap="large")
 
@@ -1654,9 +1774,13 @@ with tab1:
 
     with right:
         with st.container(border=True):
-            st.metric("Risk Level", level)
-            st.markdown(f"### :{color}[{icon} {level} Risk]")
-            st.caption(f"Screening threshold: **{THRESHOLD:.2f}**")
+            st.metric("Risk level", level)
+            st.markdown(
+                f'<div class="bandline" style="color:{BAND_COLOUR[level]}">'
+                f'<span class="banddot" style="background:{BAND_COLOUR[level]}"></span>'
+                f'{level} risk band</div>'
+                f'<div class="bandcap">Screening threshold {THRESHOLD:.2f}</div>',
+                unsafe_allow_html=True)
 
             if risk >= .6:
                 st.error(
@@ -1678,7 +1802,7 @@ with tab1:
 
     with d1:
         with st.container(border=True):
-            st.markdown("#### 🩺 Screening decision")
+            st.markdown("#### Screening decision")
             if risk >= THRESHOLD:
                 st.error(
                     f"**Positive at the tuned threshold ({THRESHOLD:.2f}).** "
@@ -1695,7 +1819,7 @@ with tab1:
 
     with d2:
         with st.container(border=True):
-            st.markdown("#### 📉 How certain is this number?")
+            st.markdown("#### How certain is this number?")
             if risk_interval:
                 low, high, neighbours = risk_interval
                 st.markdown(
@@ -1726,7 +1850,7 @@ with tab1:
 
     # ── Before / after: improving one modifiable value ──────────────────────
     st.markdown("---")
-    st.subheader("🎯 Before / After: improving one risk factor")
+    st.subheader("Before / After: improving one risk factor")
     st.markdown(
         "This re-scores the patient with **one** modifiable measurement moved to a healthy "
         "target, leaving everything else unchanged. It is a what-if scenario built from the "
@@ -1763,7 +1887,7 @@ with tab1:
                         model.predict_proba(pd.DataFrame([improved])[FEATURES])[0, 1])
                     next_risk = min(max(next_risk, 0.0), 1.0)
                 except Exception as exc:  # noqa: BLE001
-                    st.warning("⚠️ The comparison could not be scored for this value. "
+                    st.warning("The comparison could not be scored for this value. "
                                f"({type(exc).__name__})")
 
                 if next_risk is not None:
@@ -1827,7 +1951,7 @@ with tab1:
 
     # ── Stage 4: recommendation engine ─────────────────────────────────────
     st.markdown("---")
-    st.subheader("🏆 What to improve first")
+    st.subheader("What to improve first")
     st.markdown(
         "Each modifiable value is moved to its healthy target **one at a time**, then "
         "the scenarios are ranked by the risk that remains. The top row is the single "
@@ -1837,7 +1961,7 @@ with tab1:
     with st.container(border=True):
         if not rec_rows:
             st.success(
-                "✅ Every modifiable value is already at or below its healthy target, so "
+                "Every modifiable value is already at or below its healthy target, so "
                 "there is no single-change scenario left to rank. Maintaining these "
                 "values is the recommendation.")
         else:
@@ -1901,17 +2025,17 @@ with tab1:
 
     st.markdown("---")
     with st.container(border=True):
-        st.markdown("#### 🚩 Clinical flags")
+        st.markdown("#### Clinical flags")
         flags = get_flags(cleaned)
         if flags:
             for flag in flags:
                 st.markdown(f"- {flag}")
         else:
-            st.success("✅ No clinical thresholds exceeded. All entered values appear "
+            st.success("No clinical thresholds exceeded. All entered values appear "
                        "within acceptable ranges.")
 
     with st.container(border=True):
-        st.markdown("#### 📋 Patient summary")
+        st.markdown("#### Patient summary")
         summary = pd.DataFrame({
             "Feature":      [FEATURE_INFO[f]["label"] for f in FEATURES],
             "Your Value":   [fmt_value(f, cleaned[f]) for f in FEATURES],
@@ -1931,7 +2055,7 @@ with tab1:
 
 # ── Tab 2: SHAP Explainability ────────────────────────────────────────────
 with tab2:
-    st.subheader("🧠 Why did the model make this prediction?")
+    st.subheader("Why did the model make this prediction?")
     st.markdown(
         "This section uses **SHAP** (SHapley Additive exPlanations) to explain "
         "exactly which factors are driving this prediction and by how much. "
@@ -1941,7 +2065,7 @@ with tab2:
 
     if explainer is None:
         st.error(
-            "⚠️ **Explanations are temporarily unavailable — your risk score is unaffected.** "
+            "**Explanations are temporarily unavailable — your risk score is unaffected.** "
             "The SHAP explainer could not be created, most often because it timed out or "
             "ran out of memory.")
         st.caption(explainer_error or "No further details were captured.")
@@ -1956,13 +2080,13 @@ with tab2:
 
         if sv is None:
             st.warning(
-                "⚠️ **This patient's SHAP explanation could not be computed in time.** "
+                "**This patient's SHAP explanation could not be computed in time.** "
                 "The risk score above is still valid. Try reloading the page.")
             with st.expander("Technical details"):
                 st.code(shap_error)
         else:
             # ── Waterfall plot ──────────────────────────────────────────────
-            st.markdown("#### 📊 SHAP Waterfall Chart")
+            st.markdown("#### SHAP waterfall chart")
             st.markdown(
                 "This chart starts from the **average prediction** across all patients "
                 "and shows how each feature **pushes the risk up (red)** or **pulls it down (blue)** "
@@ -1973,7 +2097,7 @@ with tab2:
                 shap.plots.waterfall(sv[0], show=False)
                 st.pyplot(fig)
             except Exception as exc:  # noqa: BLE001
-                st.warning("⚠️ The waterfall chart could not be drawn. "
+                st.warning("The waterfall chart could not be drawn. "
                            f"({type(exc).__name__}: {exc})")
             finally:
                 plt.close(fig)
@@ -1990,7 +2114,7 @@ with tab2:
             top_pos = contrib[contrib["Impact"] > 0].head(4)
             top_neg = contrib[contrib["Impact"] < 0].head(4)
 
-            st.markdown("#### 📝 Plain-English Breakdown")
+            st.markdown("#### Plain-English breakdown")
             st.markdown(
                 "Below is a detailed explanation of what each factor means for this patient "
                 "and why it is increasing or decreasing the predicted risk."
@@ -1999,7 +2123,7 @@ with tab2:
             col1, col2 = st.columns(2)
 
             with col1:
-                st.markdown("### 🔴 Factors INCREASING Risk")
+                st.markdown("### 🔴 Factors increasing risk")
                 if top_pos.empty:
                     st.success("No factors are significantly increasing risk.")
                 else:
@@ -2014,7 +2138,7 @@ with tab2:
                             st.caption(f"Normal range: {FEATURE_INFO[feat]['normal']}")
 
             with col2:
-                st.markdown("### 🔵 Factors DECREASING Risk")
+                st.markdown("### 🔵 Factors decreasing risk")
                 if top_neg.empty:
                     st.info("No factors are significantly decreasing risk.")
                 else:
@@ -2031,7 +2155,7 @@ with tab2:
             st.markdown("---")
 
             # ── Full impact table ───────────────────────────────────────────
-            st.markdown("#### 📋 Complete Feature Impact Table")
+            st.markdown("#### Complete feature impact table")
             st.markdown(
                 "This table ranks all features by how strongly they influenced "
                 "this prediction. Positive impact = increases risk. Negative = reduces risk."
@@ -2048,7 +2172,7 @@ with tab2:
 
             # ── Stage 4: LIME alongside SHAP ────────────────────────────────
             st.markdown("---")
-            st.subheader("🍋 LIME — a second opinion")
+            st.subheader("LIME — a second opinion")
             st.markdown(
                 "SHAP explains this prediction by fairly distributing credit across the "
                 "features. **LIME** works differently: it perturbs this patient's values, "
@@ -2067,7 +2191,7 @@ with tab2:
                         DATA_PATH if os.path.exists(DATA_PATH) else BG_PATH)
                     lime_weights, lime_pred = lime_contribution(lime_explainer, x)
                 except Exception as exc:  # noqa: BLE001
-                    st.warning("⚠️ LIME could not explain this patient, but the SHAP "
+                    st.warning("LIME could not explain this patient, but the SHAP "
                                f"explanation above is unaffected. ({type(exc).__name__})")
                     with st.expander("Technical details"):
                         st.code(traceback.format_exc())
@@ -2169,12 +2293,12 @@ with tab2:
                 SHAP_GLOBAL_TIMEOUT, "Global SHAP values")
 
             if gsv is None:
-                st.warning("⚠️ Global feature importance could not be computed, "
+                st.warning("Global feature importance could not be computed, "
                            "but the patient-specific explanation above is unaffected.")
                 with st.expander("Technical details"):
                     st.code(gsv_error)
             else:
-                st.markdown("#### 🌍 Global Feature Importance")
+                st.markdown("#### Global feature importance")
                 st.markdown(
                     f"This chart shows which features matter **most on average across all "
                     f"{len(sample)} sampled patients** in the training data — not just for this "
@@ -2195,7 +2319,7 @@ with tab2:
                     "all patients in the dataset.")
 
                 st.markdown("---")
-                st.markdown("#### 🐝 SHAP Beeswarm Plot")
+                st.markdown("#### SHAP beeswarm plot")
                 st.markdown(
                     "Each dot is one patient from the background data. "
                     "The color shows the feature value (red = high, blue = low). "
@@ -2207,14 +2331,14 @@ with tab2:
                     shap.plots.beeswarm(gsv, show=False)
                     st.pyplot(fig3)
                 except Exception as exc:  # noqa: BLE001
-                    st.warning("⚠️ The beeswarm plot could not be drawn. "
+                    st.warning("The beeswarm plot could not be drawn. "
                                f"({type(exc).__name__}: {exc})")
                 finally:
                     plt.close(fig3)
 
                 # ── Stage 4: SHAP dependence for the top 3 features ─────────
                 st.markdown("---")
-                st.markdown("#### 📈 SHAP dependence — the three strongest features")
+                st.markdown("#### SHAP dependence — the three strongest features")
                 st.markdown(
                     "Each dot is one background patient: the x-axis is the measured value, "
                     "the y-axis is how much that value pushed that patient's prediction. A "
@@ -2266,7 +2390,7 @@ with tab2:
 
                 # ── Stage 4: two-feature interaction ────────────────────────
                 st.markdown("---")
-                st.markdown("#### 🧭 Feature interaction")
+                st.markdown("#### Feature interaction")
                 st.markdown(
                     "A dependence plot holds every other value fixed. Here two features "
                     "move together across a grid while the other six stay at this patient's "
@@ -2366,13 +2490,13 @@ with tab2:
                             "held fixed — an interaction in the model, not proof of one in "
                             "human physiology.")
                     except Exception as exc:  # noqa: BLE001
-                        st.warning("⚠️ The interaction map could not be generated. "
+                        st.warning("The interaction map could not be generated. "
                                    f"({type(exc).__name__}: {exc})")
 
             st.markdown("---")
 
             # ── What-if analysis ────────────────────────────────────────────
-            st.markdown("#### 🔬 What-If Analysis")
+            st.markdown("#### What-if analysis")
             st.markdown(
                 "Select a feature below to see how the predicted risk would change "
                 "if that value were different — while keeping everything else the same. "
@@ -2418,12 +2542,12 @@ with tab2:
                         f"**{best_val:.1f}**, and the highest near **{worst_val:.1f}**. "
                         f"Normal range for reference: {FEATURE_INFO[f_feat]['normal']}.")
                 except Exception as exc:  # noqa: BLE001
-                    st.warning("⚠️ The what-if analysis could not be generated. "
+                    st.warning("The what-if analysis could not be generated. "
                                f"({type(exc).__name__}: {exc})")
 
 # ── Tab 3: Model Performance ──────────────────────────────────────────────
 with tab3:
-    st.subheader("📊 Model Comparison")
+    st.subheader("Model comparison")
     st.markdown(
         "Four models were trained and compared using **5-fold stratified cross-validation**: "
         "Logistic Regression, Random Forest, Gradient Boosting and XGBoost. "
@@ -2435,7 +2559,7 @@ with tab3:
 
     results = meta.get("results") or {}
     if not results:
-        st.warning("⚠️ No model metrics were found in `metrics.json`. Retrain the model to "
+        st.warning("No model metrics were found in `metrics.json`. Retrain the model to "
                    "regenerate them.")
     else:
         res = pd.DataFrame(results).T.drop(columns="params", errors="ignore")
@@ -2445,12 +2569,12 @@ with tab3:
 
         best_params = (results.get(meta.get("best_model", ""), {}) or {}).get("params")
         if best_params:
-            with st.expander("🏆 Best hyper-parameters"):
+            with st.expander("Best hyper-parameters"):
                 st.json(best_params)
 
         # ── Threshold tuning ────────────────────────────────────────────────
         st.markdown("---")
-        st.markdown("#### 🎯 Decision Threshold Tuning")
+        st.markdown("#### Decision threshold tuning")
         st.markdown(
             "A 0.50 cut-off is arbitrary. Because missing a diabetic patient costs more than "
             "a false alarm, the threshold was tuned on **out-of-fold** predictions to "
@@ -2491,7 +2615,7 @@ with tab3:
         a, b = st.columns(2)
 
         with a:
-            st.markdown("#### ROC Curve")
+            st.markdown("#### ROC curve")
             st.markdown(
                 "The ROC curve shows the trade-off between catching true diabetics (recall) "
                 "and avoiding false alarms. A curve closer to the top-left corner is better. "
@@ -2513,7 +2637,7 @@ with tab3:
                 st.info("ROC data is not available in `metrics.json`.")
 
         with b:
-            st.markdown("#### Confusion Matrix")
+            st.markdown("#### Confusion matrix")
             st.markdown(
                 "Shows how many patients were correctly and incorrectly classified **at the "
                 f"tuned threshold of {THRESHOLD:.2f}**. "
@@ -2540,7 +2664,7 @@ with tab3:
                 st.info("Confusion-matrix data is not available in `metrics.json`.")
 
         st.warning(
-            "⚠️ **Important note on recall:** In medical screening, missing a diabetic patient "
+            "**Important note on recall:** In medical screening, missing a diabetic patient "
             "(false negative) is more dangerous than a false alarm (false positive). "
             f"That is why the cut-off was lowered from 0.50 to {THRESHOLD:.2f}: recall rises to "
             f"{AT_THRESHOLD.get('recall', float('nan')):.0%} at the cost of a few extra false "
@@ -2549,7 +2673,7 @@ with tab3:
 
 # ── Tab 4: Data Explorer ──────────────────────────────────────────────────
 with tab4:
-    st.subheader("🔎 Dataset Explorer")
+    st.subheader("Dataset explorer")
 
     explorer_error = None
     d = None
@@ -2562,13 +2686,13 @@ with tab4:
         explorer_error = f"`diabetes.csv` could not be read — {type(exc).__name__}: {exc}"
 
     if explorer_error:
-        st.error("⚠️ " + explorer_error)
+        st.error("" + explorer_error)
         st.caption("The other three tabs are unaffected.")
     else:
         target_col = "Outcome" if "Outcome" in d.columns else "diabetes"
 
         if target_col not in d.columns:
-            st.error("⚠️ The dataset has no `Outcome` (or `diabetes`) column, so the "
+            st.error("The dataset has no `Outcome` (or `diabetes`) column, so the "
                      "explorer cannot split patients by diabetes status.")
         else:
             st.markdown(
@@ -2607,7 +2731,7 @@ with tab4:
                            "line is drawn.")
 
             st.markdown("---")
-            st.markdown("#### Correlation Heatmap")
+            st.markdown("#### Correlation heatmap")
             st.markdown(
                 "Shows how strongly each pair of features is related. "
                 "Values close to 1 or -1 mean strong correlation. "
@@ -2617,7 +2741,7 @@ with tab4:
 
 # ── Tab 5: Patient comparison ─────────────────────────────────────────────
 with tab5:
-    st.subheader("🆚 Patient Comparison")
+    st.subheader("Patient comparison")
     st.markdown(
         "Score a second patient profile against the one in the sidebar. **Patient A** is "
         "the profile you have been editing; **Patient B** is entered independently here. "
@@ -2742,7 +2866,7 @@ with tab5:
                         f"The screening call differs: Patient {lower_name} is the one "
                         f"below the {THRESHOLD:.2f} threshold.")
                 if b_issues:
-                    st.caption("⚠️ Patient B has input warnings: "
+                    st.caption("Patient B has input warnings: "
                                + "; ".join(message for _, message in b_issues))
                 if b_missing:
                     st.caption("Patient B imputed: "
@@ -2806,7 +2930,7 @@ with tab5:
 
 # ── Tab 6: Patient history ────────────────────────────────────────────────
 with tab_hist:
-    st.subheader("🗂️ Patient history")
+    st.subheader("Patient history")
     st.markdown(
         "Every prediction you save is kept **in this app session's memory** "
         "(never written to a database or file) and plotted over time. Signing "
@@ -2816,7 +2940,7 @@ with tab_hist:
 
 # ── Tab 7: Batch prediction ───────────────────────────────────────────────
 with tab_batch:
-    st.subheader("📥 Batch prediction")
+    st.subheader("Batch prediction")
     st.markdown(
         "Upload a CSV with one row per patient and the app scores the whole "
         f"cohort in one pass (up to {BATCH_LIMIT:,} rows). Missing values and "
@@ -2916,7 +3040,7 @@ with tab_batch:
 
 # ── Tab 8: PDF report ─────────────────────────────────────────────────────
 with tab_report:
-    st.subheader("📄 PDF report")
+    st.subheader("PDF report")
     render_report_section(
         "clin_report", risk=risk, cleaned=cleaned, interval=risk_interval,
         flags=get_flags(cleaned), drivers=shap_drivers(x),
